@@ -1,0 +1,1242 @@
+import os
+import sys
+import logging
+import argparse
+import json
+import yaml
+import configparser
+import datetime
+import time
+import hashlib
+import base64
+import uuid
+import re
+import math
+import random
+import secrets
+import shutil
+import subprocess
+import threading
+import multiprocessing
+import queue
+import concurrent.futures
+from collections import defaultdict, deque, Counter
+from functools import wraps, lru_cache
+from contextlib import contextmanager
+
+# --- Configuration Globale et Initialisation ---
+
+# Chemin par défaut pour le fichier de configuration
+DEFAULT_CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'config.json')
+# Niveau de journalisation par défaut
+DEFAULT_LOG_LEVEL = logging.INFO
+# Format de journalisation
+LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+# Répertoire des logs
+LOG_DIR = os.path.join(os.path.dirname(__file__), 'logs')
+os.makedirs(LOG_DIR, exist_ok=True)
+# Fichier de log quotidien
+LOG_FILE = os.path.join(LOG_DIR, f'app_{datetime.date.today().strftime("%Y-%m-%d")}.log')
+
+# Configuration de base pour le journalisation
+logging.basicConfig(level=DEFAULT_LOG_LEVEL, format=LOG_FORMAT, handlers=[
+    logging.FileHandler(LOG_FILE),
+    logging.StreamHandler(sys.stdout)
+])
+logger = logging.getLogger(__name__)
+
+# --- Classes de Base et Utilitaires ---
+
+class ConfigManager:
+    """Gère le chargement et l'accès à la configuration de l'application."""
+    _instance = None
+    _config = {}
+
+    def __new__(cls, config_path=DEFAULT_CONFIG_PATH):
+        if cls._instance is None:
+            cls._instance = super(ConfigManager, cls).__new__(cls)
+            cls._instance._load_config(config_path)
+        return cls._instance
+
+    def _load_config(self, config_path):
+        """Charge la configuration depuis un fichier JSON, YAML ou INI."""
+        try:
+            if not os.path.exists(config_path):
+                logger.warning(f"Fichier de configuration non trouvé à : {config_path}. Utilisation d'une configuration par défaut.")
+                self._config = self._get_default_config()
+                self.save_config(config_path) # Sauve la config par défaut
+                return
+
+            ext = os.path.splitext(config_path)[1].lower()
+            if ext == '.json':
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    self._config = json.load(f)
+            elif ext == '.yaml' or ext == '.yml':
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    self._config = yaml.safe_load(f)
+            elif ext == '.ini':
+                config_parser = configparser.ConfigParser()
+                config_parser.read(config_path)
+                self._config = {section: dict(config_parser[section]) for section in config_parser.sections()}
+            else:
+                logger.error(f"Format de fichier de configuration non supporté : {ext}")
+                self._config = self._get_default_config()
+
+            logger.info(f"Configuration chargée depuis {config_path}")
+        except Exception as e:
+            logger.error(f"Erreur lors du chargement de la configuration depuis {config_path}: {e}")
+            self._config = self._get_default_config()
+
+    def _get_default_config(self):
+        """Retourne une configuration par défaut."""
+        return {
+            "app": {
+                "name": "ScriptOmniscient",
+                "version": "1.0.0",
+                "environment": "development"
+            },
+            "logging": {
+                "level": "INFO",
+                "file": LOG_FILE,
+                "format": LOG_FORMAT
+            },
+            "database": {
+                "type": "sqlite",
+                "path": "data.db"
+            },
+            "api": {
+                "key": "your_api_key_here",
+                "endpoint": "https://api.example.com"
+            },
+            "performance": {
+                "max_threads": os.cpu_count() * 2,
+                "timeout_seconds": 30
+            },
+            "security": {
+                "salt_length": 16,
+                "hashing_rounds": 100000
+            },
+            "project_templates": {
+                "web": "https://github.com/your-org/web-template.git",
+                "backend": "https://github.com/your-org/backend-template.git",
+                "mobile": "https://github.com/your-org/mobile-template.git"
+            },
+            "github": {
+                "username": "your_github_username",
+                "token": "your_github_personal_access_token" # IMPORTANT: Store securely!
+            },
+            "vercel": {
+                "token": "your_vercel_access_token" # IMPORTANT: Store securely!
+            },
+            "aws": {
+                "access_key_id": "your_aws_access_key_id", # IMPORTANT: Store securely!
+                "secret_access_key": "your_aws_secret_access_key", # IMPORTANT: Store securely!
+                "region": "eu-west-3"
+            }
+        }
+
+    def get(self, key_path, default=None):
+        """
+        Récupère une valeur de configuration en utilisant un chemin de clé (ex: "app.name").
+        """
+        keys = key_path.split('.')
+        value = self._config
+        try:
+            for key in keys:
+                value = value[key]
+            return value
+        except KeyError:
+            logger.warning(f"Clé de configuration '{key_path}' non trouvée. Retourne la valeur par défaut : {default}")
+            return default
+
+    def set(self, key_path, value):
+        """Définit une valeur de configuration en utilisant un chemin de clé."""
+        keys = key_path.split('.')
+        config_node = self._config
+        for i, key in enumerate(keys):
+            if i == len(keys) - 1:
+                config_node[key] = value
+            else:
+                if key not in config_node or not isinstance(config_node[key], dict):
+                    config_node[key] = {}
+                config_node = config_node[key]
+        logger.info(f"Configuration mise à jour: {key_path} = {value}")
+
+    def save_config(self, config_path=DEFAULT_CONFIG_PATH):
+        """Sauvegarde la configuration actuelle dans un fichier JSON."""
+        try:
+            with open(config_path, 'w', encoding='utf-8') as f:
+                json.dump(self._config, f, indent=4)
+            logger.info(f"Configuration sauvegardée dans {config_path}")
+        except Exception as e:
+            logger.error(f"Erreur lors de la sauvegarde de la configuration dans {config_path}: {e}")
+
+class AppError(Exception):
+    """Classe de base pour les erreurs spécifiques à l'application."""
+    def __init__(self, message="Une erreur est survenue dans l'application.", code=500):
+        super().__init__(message)
+        self.message = message
+        self.code = code
+        logger.error(f"AppError [{self.code}]: {self.message}")
+
+class ValidationError(AppError):
+    """Erreur de validation des données."""
+    def __init__(self, message="Erreur de validation des données.", field=None, code=400):
+        super().__init__(message, code)
+        self.field = field
+
+class NetworkError(AppError):
+    """Erreur liée au réseau."""
+    def __init__(self, message="Erreur réseau.", url=None, status_code=None, code=503):
+        super().__init__(message, code)
+        self.url = url
+        self.status_code = status_code
+
+class FileSystemError(AppError):
+    """Erreur liée au système de fichiers."""
+    def __init__(self, message="Erreur du système de fichiers.", path=None, code=500):
+        super().__init__(message, code)
+        self.path = path
+
+class ExternalCommandError(AppError):
+    """Erreur lors de l'exécution d'une commande externe."""
+    def __init__(self, message="Erreur d'exécution de commande externe.", command=None, return_code=None, stdout=None, stderr=None, code=500):
+        super().__init__(message, code)
+        self.command = command
+        self.return_code = return_code
+        self.stdout = stdout
+        self.stderr = stderr
+        logger.error(f"Commande '{self.command}' a échoué avec le code {self.return_code}.\nStderr: {self.stderr}")
+
+class Utility:
+    """Classe utilitaire pour des fonctions diverses."""
+
+    @staticmethod
+    def hash_data(data: str, algorithm='sha256') -> str:
+        """Hache une chaîne de caractères."""
+        try:
+            hasher = hashlib.new(algorithm)
+            hasher.update(data.encode('utf-8'))
+            return hasher.hexdigest()
+        except ValueError:
+            raise AppError(f"Algorithme de hachage '{algorithm}' non supporté.")
+        except Exception as e:
+            raise AppError(f"Erreur lors du hachage des données : {e}")
+
+    @staticmethod
+    def generate_uuid() -> str:
+        """Génère un UUID v4."""
+        return str(uuid.uuid4())
+
+    @staticmethod
+    def base64_encode(data: str) -> str:
+        """Encode une chaîne en Base64."""
+        return base64.b64encode(data.encode('utf-8')).decode('utf-8')
+
+    @staticmethod
+    def base64_decode(data: str) -> str:
+        """Décode une chaîne Base64."""
+        try:
+            return base64.b64decode(data.encode('utf-8')).decode('utf-8')
+        except Exception as e:
+            raise ValidationError(f"Données Base64 invalides : {e}")
+
+    @staticmethod
+    def sanitize_filename(filename: str, replacement='_') -> str:
+        """Assainit un nom de fichier pour le rendre sûr."""
+        return re.sub(r'[<>:"/\\|?*]', replacement, filename)
+
+    @staticmethod
+    def measure_execution_time(func):
+        """Décorateur pour mesurer le temps d'exécution d'une fonction."""
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            start_time = time.perf_counter()
+            result = func(*args, **kwargs)
+            end_time = time.perf_counter()
+            logger.debug(f"Fonction '{func.__name__}' exécutée en {end_time - start_time:.4f} secondes.")
+            return result
+        return wrapper
+
+    @staticmethod
+    @contextmanager
+    def safe_file_operation(file_path, mode='r', encoding='utf-8'):
+        """Contexte manager pour des opérations de fichier sûres."""
+        file_obj = None
+        try:
+            file_obj = open(file_path, mode, encoding=encoding)
+            yield file_obj
+        except FileNotFoundError:
+            raise FileSystemError(f"Fichier non trouvé : {file_path}", path=file_path)
+        except PermissionError:
+            raise FileSystemError(f"Permission refusée pour le fichier : {file_path}", path=file_path)
+        except Exception as e:
+            raise FileSystemError(f"Erreur lors de l'opération sur le fichier {file_path}: {e}", path=file_path)
+        finally:
+            if file_obj:
+                file_obj.close()
+
+    @staticmethod
+    def retry_on_exception(retries=3, delay=1, backoff_factor=2, exceptions=(Exception,)):
+        """Décorateur pour réessayer une fonction en cas d'exception."""
+        def decorator(func):
+            @wraps(func)
+            def wrapper(*args, **kwargs):
+                _retries = retries
+                _delay = delay
+                while _retries > 0:
+                    try:
+                        return func(*args, **kwargs)
+                    except exceptions as e:
+                        logger.warning(f"Tentative échouée pour '{func.__name__}': {e}. Nouvelle tentative dans {_delay:.2f}s...")
+                        time.sleep(_delay)
+                        _retries -= 1
+                        _delay *= backoff_factor
+                raise AppError(f"La fonction '{func.__name__}' a échoué après {retries} tentatives.")
+            return wrapper
+        return decorator
+
+    @staticmethod
+    def execute_command(command, cwd=None, shell=False, capture_output=True, check=True):
+        """Exécute une commande shell et gère les erreurs."""
+        logger.debug(f"Exécution de la commande: {' '.join(command) if isinstance(command, list) else command} dans {cwd if cwd else 'CWD'}")
+        try:
+            result = subprocess.run(
+                command,
+                cwd=cwd,
+                shell=shell,
+                capture_output=capture_output,
+                text=True, # Décode stdout/stderr en texte
+                check=check # Lève CalledProcessError si le code de retour est non nul
+            )
+            if check and result.returncode != 0:
+                raise ExternalCommandError(
+                    f"Commande '{command}' a échoué.",
+                    command=command,
+                    return_code=result.returncode,
+                    stdout=result.stdout,
+                    stderr=result.stderr
+                )
+            logger.info(f"Commande réussie: {command}")
+            if capture_output:
+                return result.stdout.strip()
+            return True
+        except FileNotFoundError:
+            raise ExternalCommandError(f"Commande '{command[0] if isinstance(command, list) else command.split(' ')[0]}' non trouvée. Assurez-vous qu'elle est installée et dans le PATH.", command=command)
+        except ExternalCommandError: # Re-raise nos exceptions
+            raise
+        except Exception as e:
+            raise ExternalCommandError(f"Erreur inattendue lors de l'exécution de la commande '{command}': {e}", command=command)
+
+
+# --- Gestion des Modules et Plugins ---
+
+class ModuleManager:
+    """Gère le chargement, l'enregistrement et l'exécution des modules."""
+    _modules = {}
+
+    def register_module(self, name: str, module_class: type):
+        """Enregistre un module avec un nom donné."""
+        if not issubclass(module_class, BaseModule):
+            raise TypeError("Le module doit hériter de BaseModule.")
+        if name in self._modules:
+            logger.warning(f"Le module '{name}' est déjà enregistré et sera remplacé.")
+        self._modules[name] = module_class
+        logger.info(f"Module '{name}' enregistré.")
+
+    def get_module_instance(self, name: str, config_manager: ConfigManager):
+        """Retourne une instance d'un module enregistré."""
+        module_class = self._modules.get(name)
+        if not module_class:
+            raise AppError(f"Le module '{name}' n'est pas enregistré.")
+        return module_class(config_manager)
+
+    def list_modules(self):
+        """Liste tous les modules enregistrés."""
+        return list(self._modules.keys())
+
+class BaseModule:
+    """Classe de base abstraite pour tous les modules de l'application."""
+    def __init__(self, config_manager: ConfigManager):
+        self.config = config_manager
+        self.logger = logging.getLogger(self.__class__.__name__)
+        self.logger.info(f"Module '{self.__class__.__name__}' initialisé.")
+
+    def run(self, *args, **kwargs):
+        """Méthode principale à implémenter par les modules spécifiques."""
+        raise NotImplementedError("La méthode 'run' doit être implémentée par la classe enfant.")
+
+    def configure(self, *args, **kwargs):
+        """Méthode optionnelle pour la configuration du module."""
+        self.logger.debug(f"Configuration du module '{self.__class__.__name__}'.")
+
+# --- Modules Spécifiques (Basés sur l'ancien script) ---
+
+class ProjectManagementModule(BaseModule):
+    """Module pour la création et la gestion de projets (localement)."""
+    def __init__(self, config_manager: ConfigManager):
+        super().__init__(config_manager)
+        self.base_project_dir = os.path.join(os.getcwd(), "projects") # Ou configurable
+        os.makedirs(self.base_project_dir, exist_ok=True)
+        self.templates = self.config.get("project_templates", {})
+
+    @Utility.measure_execution_time
+    def run(self, action: str, project_name: str, template_type: str = None, vcs_init: bool = False, install_deps: bool = False, **kwargs):
+        self.logger.info(f"Exécution de ProjectManagementModule pour le projet '{project_name}' avec l'action: {action}")
+        project_path = os.path.join(self.base_project_dir, project_name)
+
+        if action == "create":
+            if os.path.exists(project_path):
+                raise FileSystemError(f"Le projet '{project_name}' existe déjà à '{project_path}'.")
+            self._create_project(project_path, template_type)
+            if vcs_init:
+                self._init_git_repo(project_path)
+            if install_deps:
+                self._install_dependencies(project_path, template_type)
+            return {"status": "success", "message": f"Projet '{project_name}' créé avec succès à {project_path}."}
+        elif action == "delete":
+            return self._delete_project(project_path)
+        elif action == "init_git":
+            return self._init_git_repo(project_path)
+        elif action == "install_deps":
+            return self._install_dependencies(project_path, template_type)
+        else:
+            raise AppError(f"Action '{action}' non supportée par ProjectManagementModule.")
+
+    def _create_project(self, project_path, template_type):
+        """Crée un nouveau dossier de projet ou clone un template."""
+        if template_type:
+            template_url = self.templates.get(template_type)
+            if not template_url:
+                raise ValidationError(f"Type de template '{template_type}' non configuré. Templates disponibles: {list(self.templates.keys())}")
+            self.logger.info(f"Clonage du template '{template_type}' depuis '{template_url}' vers '{project_path}'...")
+            Utility.execute_command(["git", "clone", template_url, project_path])
+        else:
+            os.makedirs(project_path)
+            self.logger.info(f"Dossier de projet '{project_path}' créé.")
+            # Créer un fichier README par défaut
+            with Utility.safe_file_operation(os.path.join(project_path, "README.md"), 'w') as f:
+                f.write(f"# Projet {os.path.basename(project_path)}\n\nDescription de votre nouveau projet.")
+        self.logger.info(f"Projet '{os.path.basename(project_path)}' créé à {project_path}.")
+
+    def _delete_project(self, project_path):
+        """Supprime un dossier de projet."""
+        if not os.path.exists(project_path):
+            raise FileSystemError(f"Le projet '{os.path.basename(project_path)}' n'existe pas à '{project_path}'.")
+        shutil.rmtree(project_path)
+        self.logger.info(f"Projet '{os.path.basename(project_path)}' supprimé de {project_path}.")
+        return {"status": "success", "message": f"Projet '{os.path.basename(project_path)}' supprimé."}
+
+    def _init_git_repo(self, project_path):
+        """Initialise un dépôt Git."""
+        self.logger.info(f"Initialisation du dépôt Git dans '{project_path}'...")
+        if not os.path.exists(os.path.join(project_path, ".git")):
+            Utility.execute_command(["git", "init"], cwd=project_path)
+            # Créer un .gitignore simple
+            with Utility.safe_file_operation(os.path.join(project_path, ".gitignore"), 'w') as f:
+                f.write("__pycache__/\n*.pyc\n.env\nnod_modules/\nbuild/\ndist/\n")
+            self.logger.info("Dépôt Git initialisé et .gitignore créé.")
+        else:
+            self.logger.info("Dépôt Git déjà existant. Skipping initialization.")
+        return {"status": "success", "message": "Dépôt Git initialisé."}
+
+    def _install_dependencies(self, project_path, template_type):
+        """Installe les dépendances basées sur le type de projet."""
+        self.logger.info(f"Installation des dépendances pour '{project_path}' (type: {template_type})...")
+        if template_type == "web":
+            Utility.execute_command(["npm", "install"], cwd=project_path)
+            self.logger.info("Dépendances npm installées.")
+        elif template_type == "backend":
+            Utility.execute_command([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"], cwd=project_path)
+            self.logger.info("Dépendances Python installées.")
+        else:
+            self.logger.warning(f"Pas de méthode d'installation de dépendances définie pour le type de template '{template_type}'. Skipping.")
+        return {"status": "success", "message": "Dépendances installées si applicable."}
+
+
+class GitHubModule(BaseModule):
+    """Module pour les opérations GitHub (création de dépôt, push)."""
+    def __init__(self, config_manager: ConfigManager):
+        super().__init__(config_manager)
+        self.github_username = self.config.get("github.username")
+        self.github_token = self.config.get("github.token")
+        if not self.github_username or not self.github_token:
+            self.logger.warning("Nom d'utilisateur ou token GitHub non configuré. Certaines fonctions peuvent échouer.")
+        try:
+            import requests
+        except ImportError:
+            raise AppError("Le module 'requests' est requis pour GitHubModule. Installez-le avec 'pip install requests'.")
+        self.requests = requests
+        self.github_api_url = "https://api.github.com"
+
+    @Utility.measure_execution_time
+    @Utility.retry_on_exception(retries=3, delay=5, exceptions=(NetworkError, self.requests.exceptions.ConnectionError))
+    def run(self, action: str, repo_name: str, org_name: str = None, project_path: str = None, private: bool = True, **kwargs):
+        self.logger.info(f"Exécution de GitHubModule pour le dépôt '{repo_name}' avec l'action: {action}")
+
+        if action == "create_repo":
+            return self._create_github_repo(repo_name, org_name, private)
+        elif action == "push_initial":
+            if not project_path:
+                raise ValidationError("Chemin du projet local requis pour l'action 'push_initial'.")
+            return self._push_initial_commit(repo_name, project_path, org_name)
+        else:
+            raise AppError(f"Action '{action}' non supportée par GitHubModule.")
+
+    def _create_github_repo(self, repo_name: str, org_name: str = None, private: bool = True):
+        """Crée un nouveau dépôt GitHub."""
+        headers = {
+            "Authorization": f"token {self.github_token}",
+            "Accept": "application/vnd.github.v3+json"
+        }
+        data = {
+            "name": repo_name,
+            "private": private,
+            "auto_init": False # Nous voulons initier localement
+        }
+        url = f"{self.github_api_url}/user/repos"
+        if org_name:
+            url = f"{self.github_api_url}/orgs/{org_name}/repos"
+            self.logger.info(f"Création d'un dépôt dans l'organisation GitHub: {org_name}")
+
+        self.logger.info(f"Création du dépôt GitHub '{repo_name}'...")
+        try:
+            response = self.requests.post(url, headers=headers, json=data)
+            response.raise_for_status()
+            repo_data = response.json()
+            self.logger.info(f"Dépôt GitHub '{repo_name}' créé : {repo_data['html_url']}")
+            return {"status": "success", "message": f"Dépôt créé : {repo_data['html_url']}", "url": repo_data['html_url']}
+        except self.requests.exceptions.HTTPError as e:
+            if e.response.status_code == 422 and "name already exists" in e.response.text:
+                self.logger.warning(f"Dépôt '{repo_name}' existe déjà sur GitHub. Skipping creation.")
+                return {"status": "skipped", "message": f"Dépôt '{repo_name}' existe déjà."}
+            raise NetworkError(f"Erreur HTTP lors de la création du dépôt GitHub: {e.response.status_code} - {e.response.text}", url=url, status_code=e.response.status_code)
+        except Exception as e:
+            raise AppError(f"Erreur lors de la création du dépôt GitHub: {e}")
+
+    def _push_initial_commit(self, repo_name: str, project_path: str, org_name: str = None):
+        """Effectue le push initial vers le dépôt GitHub."""
+        repo_url = f"https://github.com/{org_name if org_name else self.github_username}/{repo_name}.git"
+        self.logger.info(f"Configuration du dépôt distant et push initial pour '{project_path}' vers '{repo_url}'...")
+
+        try:
+            # Vérifier si .git existe
+            if not os.path.exists(os.path.join(project_path, ".git")):
+                raise FileSystemError(f"Le dossier '{project_path}' n'est pas un dépôt Git initialisé. Exécutez 'project_management create' avec vcs_init=True ou 'project_management init_git'.")
+
+            Utility.execute_command(["git", "remote", "add", "origin", repo_url], cwd=project_path)
+            Utility.execute_command(["git", "branch", "-M", "main"], cwd=project_path)
+            Utility.execute_command(["git", "add", "."], cwd=project_path)
+            Utility.execute_command(["git", "commit", "-m", "Initial commit from ScriptOmniscient"], cwd=project_path)
+            Utility.execute_command(["git", "push", "-u", "origin", "main"], cwd=project_path)
+
+            self.logger.info(f"Push initial réussi pour le dépôt '{repo_name}'.")
+            return {"status": "success", "message": "Push initial vers GitHub réussi.", "repo_url": repo_url}
+        except ExternalCommandError:
+            raise # Déjà géré par ExternalCommandError
+        except FileSystemError:
+            raise
+        except Exception as e:
+            raise AppError(f"Erreur lors du push initial vers GitHub: {e}")
+
+
+class CloudDeploymentModule(BaseModule):
+    """Module pour le déploiement sur des plateformes cloud (ex: Vercel, Netlify)."""
+    def __init__(self, config_manager: ConfigManager):
+        super().__init__(config_manager)
+        self.vercel_token = self.config.get("vercel.token")
+        if not self.vercel_token:
+            self.logger.warning("Token Vercel non configuré. Le déploiement Vercel peut échouer.")
+        try:
+            import requests
+        except ImportError:
+            raise AppError("Le module 'requests' est requis pour CloudDeploymentModule. Installez-le avec 'pip install requests'.")
+        self.requests = requests
+
+    @Utility.measure_execution_time
+    @Utility.retry_on_exception(retries=3, delay=5, exceptions=(NetworkError, self.requests.exceptions.ConnectionError))
+    def run(self, action: str, platform: str, project_path: str, project_name: str = None, **kwargs):
+        self.logger.info(f"Exécution de CloudDeploymentModule pour le projet '{project_path}' sur la plateforme '{platform}' avec l'action: {action}")
+
+        if action == "deploy":
+            if platform.lower() == "vercel":
+                return self._deploy_to_vercel(project_path, project_name)
+            # elif platform.lower() == "netlify":
+            #     return self._deploy_to_netlify(project_path, project_name)
+            else:
+                raise ValidationError(f"Plateforme de déploiement '{platform}' non supportée.")
+        elif action == "connect_domain":
+            # Action future pour connecter un domaine personnalisé
+            domain = kwargs.get("domain")
+            if not domain:
+                raise ValidationError("Le nom de domaine est requis pour l'action 'connect_domain'.")
+            self.logger.info(f"Connexion du domaine '{domain}' (fonctionnalité à implémenter).")
+            return {"status": "info", "message": f"Fonctionnalité de connexion de domaine pour '{platform}' n'est pas encore implémentée."}
+        else:
+            raise AppError(f"Action '{action}' non supportée par CloudDeploymentModule.")
+
+    def _deploy_to_vercel(self, project_path: str, project_name: str = None):
+        """Déploie un projet sur Vercel."""
+        if not os.path.isdir(project_path):
+            raise FileSystemError(f"Le chemin du projet '{project_path}' n'est pas un répertoire valide.")
+
+        self.logger.info(f"Déploiement du projet '{project_path}' sur Vercel...")
+        try:
+            # Assurez-vous que Vercel CLI est installé
+            Utility.execute_command(["vercel", "--version"], capture_output=False)
+        except ExternalCommandError:
+            raise AppError("Vercel CLI n'est pas installé ou n'est pas dans le PATH. Installez-le avec 'npm i -g vercel'.")
+
+        try:
+            # Utilisation du token Vercel pour l'authentification
+            env = os.environ.copy()
+            env["VERCEL_TOKEN"] = self.vercel_token
+
+            # Déploiement Vercel
+            # project_name est utilisé pour --name, sinon Vercel utilise le nom du répertoire
+            command = ["vercel", "--prod"] # --prod pour un déploiement en production
+            if project_name:
+                command.extend(["--name", project_name])
+
+            self.logger.debug(f"Exécution de Vercel CLI dans '{project_path}' avec la commande: {command}")
+            # Le résultat de vercel deploy contient l'URL de déploiement
+            output = Utility.execute_command(command, cwd=project_path, env=env)
+
+            # Extraire l'URL du déploiement
+            deploy_url_match = re.search(r'https?://[\w.-]+\.vercel\.app', output)
+            deploy_url = deploy_url_match.group(0) if deploy_url_match else "URL non trouvée"
+
+            self.logger.info(f"Projet déployé sur Vercel. URL : {deploy_url}")
+            return {"status": "success", "message": f"Projet déployé sur Vercel. URL: {deploy_url}", "url": deploy_url}
+        except ExternalCommandError as e:
+            # Vercel CLI peut renvoyer des erreurs si le projet n'est pas lié ou si le token est invalide
+            if "not linked" in e.stderr:
+                self.logger.warning(f"Le projet '{project_path}' n'est pas lié à Vercel. Tentative de liaison...")
+                try:
+                    # Tenter de lier le projet. Cela peut nécessiter une interaction manuelle si le projet n'existe pas
+                    # ou demander si on veut créer un nouveau projet.
+                    # Pour une automatisation complète, il faudrait un mécanisme pour créer le projet Vercel d'abord
+                    # via l'API Vercel si non existant.
+                    link_output = Utility.execute_command(["vercel", "link"], cwd=project_path, env=env, capture_output=False)
+                    self.logger.info("Projet lié à Vercel. Réessayez le déploiement.")
+                    # Après liaison, on pourrait retenter le déploiement ici ou demander à l'utilisateur de relancer.
+                    # Pour simplifier, nous levons une erreur pour un relancement manuel ou un workflow plus complexe.
+                    raise AppError(f"Le projet '{project_path}' a été lié à Vercel. Veuillez réessayer l'opération de déploiement.")
+                except ExternalCommandError as link_e:
+                     raise ExternalCommandError(f"Erreur lors de la liaison du projet Vercel: {link_e.stderr}", command=link_e.command, return_code=link_e.return_code, stdout=link_e.stdout, stderr=link_e.stderr)
+            raise # Re-raise l'erreur originale de déploiement
+        except Exception as e:
+            raise AppError(f"Erreur inattendue lors du déploiement Vercel: {e}")
+
+class AWSModule(BaseModule):
+    """Module pour les opérations AWS (S3, EC2, etc.)."""
+    def __init__(self, config_manager: ConfigManager):
+        super().__init__(config_manager)
+        self.aws_access_key_id = self.config.get("aws.access_key_id")
+        self.aws_secret_access_key = self.config.get("aws.secret_access_key")
+        self.aws_region = self.config.get("aws.region", "eu-west-3")
+        if not self.aws_access_key_id or not self.aws_secret_access_key:
+            self.logger.warning("Clés d'accès AWS non configurées. Les opérations AWS peuvent échouer.")
+        try:
+            import boto3
+            from botocore.exceptions import ClientError
+        except ImportError:
+            raise AppError("Le module 'boto3' est requis pour AWSModule. Installez-le avec 'pip install boto3'.")
+        self.boto3 = boto3
+        self.ClientError = ClientError
+
+    @Utility.measure_execution_time
+    @Utility.retry_on_exception(retries=5, delay=3, exceptions=(NetworkError, self.ClientError))
+    def run(self, action: str, service: str, **kwargs):
+        self.logger.info(f"Exécution de AWSModule pour le service '{service}' avec l'action: {action}")
+
+        if service.lower() == "s3":
+            return self._handle_s3_operation(action, **kwargs)
+        # elif service.lower() == "ec2":
+        #     return self._handle_ec2_operation(action, **kwargs)
+        else:
+            raise ValidationError(f"Service AWS '{service}' non supporté.")
+
+    def _handle_s3_operation(self, action: str, bucket_name: str, file_path: str = None, s3_key: str = None, local_dir: str = None, **kwargs):
+        """Gère les opérations S3."""
+        s3 = self.boto3.client('s3',
+                               aws_access_key_id=self.aws_access_key_id,
+                               aws_secret_access_key=self.aws_secret_access_key,
+                               region_name=self.aws_region)
+
+        if action == "create_bucket":
+            return self._s3_create_bucket(s3, bucket_name)
+        elif action == "upload_file":
+            if not file_path or not s3_key:
+                raise ValidationError("Chemin du fichier local et clé S3 sont requis pour l'upload.")
+            return self._s3_upload_file(s3, bucket_name, file_path, s3_key)
+        elif action == "download_file":
+            if not s3_key or not local_dir:
+                raise ValidationError("Clé S3 et répertoire local sont requis pour le téléchargement.")
+            return self._s3_download_file(s3, bucket_name, s3_key, local_dir)
+        elif action == "list_objects":
+            return self._s3_list_objects(s3, bucket_name)
+        elif action == "delete_object":
+            if not s3_key:
+                raise ValidationError("Clé S3 est requise pour la suppression d'objet.")
+            return self._s3_delete_object(s3, bucket_name, s3_key)
+        elif action == "delete_bucket":
+            return self._s3_delete_bucket(s3, bucket_name)
+        else:
+            raise AppError(f"Action S3 '{action}' non supportée.")
+
+    def _s3_create_bucket(self, s3_client, bucket_name):
+        """Crée un bucket S3."""
+        self.logger.info(f"Création du bucket S3: {bucket_name}")
+        try:
+            s3_client.create_bucket(Bucket=bucket_name, CreateBucketConfiguration={'LocationConstraint': self.aws_region})
+            self.logger.info(f"Bucket '{bucket_name}' créé avec succès.")
+            return {"status": "success", "message": f"Bucket '{bucket_name}' créé."}
+        except self.ClientError as e:
+            if e.response['Error']['Code'] == 'BucketAlreadyOwnedByYou':
+                self.logger.warning(f"Bucket '{bucket_name}' existe déjà et vous en êtes le propriétaire. Skipping creation.")
+                return {"status": "skipped", "message": f"Bucket '{bucket_name}' existe déjà."}
+            raise NetworkError(f"Erreur AWS S3 lors de la création du bucket: {e}", status_code=e.response['ResponseMetadata']['HTTPStatusCode'])
+        except Exception as e:
+            raise AppError(f"Erreur inattendue lors de la création du bucket S3: {e}")
+
+    def _s3_upload_file(self, s3_client, bucket_name, file_path, s3_key):
+        """Upload un fichier vers un bucket S3."""
+        if not os.path.exists(file_path) or not os.path.isfile(file_path):
+            raise FileSystemError(f"Le fichier local '{file_path}' n'existe pas ou n'est pas un fichier.")
+        self.logger.info(f"Upload du fichier '{file_path}' vers s3://{bucket_name}/{s3_key}")
+        try:
+            s3_client.upload_file(file_path, bucket_name, s3_key)
+            self.logger.info(f"Fichier '{file_path}' uploadé avec succès vers S3.")
+            return {"status": "success", "message": f"Fichier uploadé vers s3://{bucket_name}/{s3_key}"}
+        except self.ClientError as e:
+            raise NetworkError(f"Erreur AWS S3 lors de l'upload: {e}", status_code=e.response['ResponseMetadata']['HTTPStatusCode'])
+        except Exception as e:
+            raise AppError(f"Erreur inattendue lors de l'upload S3: {e}")
+
+    def _s3_download_file(self, s3_client, bucket_name, s3_key, local_dir):
+        """Télécharge un fichier depuis S3."""
+        os.makedirs(local_dir, exist_ok=True)
+        local_path = os.path.join(local_dir, os.path.basename(s3_key))
+        self.logger.info(f"Téléchargement de s3://{bucket_name}/{s3_key} vers '{local_path}'")
+        try:
+            s3_client.download_file(bucket_name, s3_key, local_path)
+            self.logger.info(f"Fichier '{s3_key}' téléchargé avec succès vers '{local_path}'.")
+            return {"status": "success", "message": f"Fichier téléchargé vers {local_path}"}
+        except self.ClientError as e:
+            if e.response['Error']['Code'] == 'NoSuchKey':
+                raise FileSystemError(f"La clé S3 '{s3_key}' n'existe pas dans le bucket '{bucket_name}'.")
+            raise NetworkError(f"Erreur AWS S3 lors du téléchargement: {e}", status_code=e.response['ResponseMetadata']['HTTPStatusCode'])
+        except Exception as e:
+            raise AppError(f"Erreur inattendue lors du téléchargement S3: {e}")
+
+    def _s3_list_objects(self, s3_client, bucket_name):
+        """Liste les objets dans un bucket S3."""
+        self.logger.info(f"Liste des objets dans le bucket S3: {bucket_name}")
+        try:
+            response = s3_client.list_objects_v2(Bucket=bucket_name)
+            contents = response.get('Contents', [])
+            object_keys = [obj['Key'] for obj in contents]
+            self.logger.info(f"Objets dans '{bucket_name}': {object_keys}")
+            return {"status": "success", "objects": object_keys}
+        except self.ClientError as e:
+            if e.response['Error']['Code'] == 'NoSuchBucket':
+                raise FileSystemError(f"Le bucket '{bucket_name}' n'existe pas.")
+            raise NetworkError(f"Erreur AWS S3 lors de la liste des objets: {e}", status_code=e.response['ResponseMetadata']['HTTPStatusCode'])
+        except Exception as e:
+            raise AppError(f"Erreur inattendue lors de la liste des objets S3: {e}")
+
+    def _s3_delete_object(self, s3_client, bucket_name, s3_key):
+        """Supprime un objet d'un bucket S3."""
+        self.logger.info(f"Suppression de l'objet s3://{bucket_name}/{s3_key}")
+        try:
+            s3_client.delete_object(Bucket=bucket_name, Key=s3_key)
+            self.logger.info(f"Objet '{s3_key}' supprimé avec succès du bucket '{bucket_name}'.")
+            return {"status": "success", "message": f"Objet s3://{bucket_name}/{s3_key} supprimé."}
+        except self.ClientError as e:
+            raise NetworkError(f"Erreur AWS S3 lors de la suppression d'objet: {e}", status_code=e.response['ResponseMetadata']['HTTPStatusCode'])
+        except Exception as e:
+            raise AppError(f"Erreur inattendue lors de la suppression d'objet S3: {e}")
+
+    def _s3_delete_bucket(self, s3_client, bucket_name):
+        """Supprime un bucket S3 (doit être vide)."""
+        self.logger.info(f"Suppression du bucket S3: {bucket_name}")
+        try:
+            # Vérifier si le bucket est vide avant de le supprimer
+            objects = self._s3_list_objects(s3_client, bucket_name)["objects"]
+            if objects:
+                raise ValidationError(f"Le bucket '{bucket_name}' n'est pas vide. Veuillez supprimer tous les objets avant de supprimer le bucket.")
+
+            s3_client.delete_bucket(Bucket=bucket_name)
+            self.logger.info(f"Bucket '{bucket_name}' supprimé avec succès.")
+            return {"status": "success", "message": f"Bucket '{bucket_name}' supprimé."}
+        except self.ClientError as e:
+            if e.response['Error']['Code'] == 'NoSuchBucket':
+                self.logger.warning(f"Bucket '{bucket_name}' n'existe pas. Skipping deletion.")
+                return {"status": "skipped", "message": f"Bucket '{bucket_name}' n'existe pas."}
+            raise NetworkError(f"Erreur AWS S3 lors de la suppression du bucket: {e}", status_code=e.response['ResponseMetadata']['HTTPStatusCode'])
+        except ValidationError: # Re-raise si le bucket n'est pas vide
+            raise
+        except Exception as e:
+            raise AppError(f"Erreur inattendue lors de la suppression du bucket S3: {e}")
+
+
+class SystemUtilityModule(BaseModule):
+    """Module pour les opérations système générales (nettoyage, info)."""
+    def __init__(self, config_manager: ConfigManager):
+        super().__init__(config_manager)
+
+    @Utility.measure_execution_time
+    def run(self, action: str, path: str = None, **kwargs):
+        self.logger.info(f"Exécution de SystemUtilityModule avec l'action: {action}")
+
+        if action == "clean_logs":
+            return self._clean_logs()
+        elif action == "get_disk_space":
+            if not path:
+                raise ValidationError("Un chemin est requis pour obtenir l'espace disque.")
+            return self._get_disk_space(path)
+        elif action == "create_dir":
+            if not path:
+                raise ValidationError("Un chemin est requis pour créer un répertoire.")
+            return self._create_directory(path)
+        elif action == "delete_dir":
+            if not path:
+                raise ValidationError("Un chemin est requis pour supprimer un répertoire.")
+            return self._delete_directory(path)
+        else:
+            raise AppError(f"Action '{action}' non supportée par SystemUtilityModule.")
+
+    def _clean_logs(self):
+        """Nettoie les fichiers de log anciens."""
+        retained_days = 7 # Conserver les logs des 7 derniers jours
+        cleaned_files_count = 0
+        cleaned_size_bytes = 0
+        current_date = datetime.date.today()
+
+        self.logger.info(f"Nettoyage des logs plus anciens que {retained_days} jours dans '{LOG_DIR}'...")
+        for filename in os.listdir(LOG_DIR):
+            file_path = os.path.join(LOG_DIR, filename)
+            if os.path.isfile(file_path) and filename.startswith("app_") and filename.endswith(".log"):
+                try:
+                    # Extraire la date du nom de fichier (ex: app_2023-10-26.log)
+                    file_date_str = filename[len("app_"): -len(".log")]
+                    file_date = datetime.datetime.strptime(file_date_str, "%Y-%m-%d").date()
+                    if (current_date - file_date).days > retained_days:
+                        file_size = os.path.getsize(file_path)
+                        os.remove(file_path)
+                        cleaned_files_count += 1
+                        cleaned_size_bytes += file_size
+                        self.logger.info(f"Supprimé le fichier de log ancien: {filename}")
+                except ValueError:
+                    self.logger.warning(f"Format de date invalide dans le nom de fichier de log: {filename}. Skipping.")
+                except Exception as e:
+                    self.logger.error(f"Erreur lors de la suppression du fichier de log '{filename}': {e}")
+        self.logger.info(f"Nettoyage des logs terminé. Supprimé {cleaned_files_count} fichiers, libéré {cleaned_size_bytes / (1024*1024):.2f} Mo.")
+        return {"status": "success", "message": f"Nettoyage des logs terminé. {cleaned_files_count} fichiers supprimés."}
+
+    def _get_disk_space(self, path):
+        """Obtient l'espace disque disponible pour un chemin donné."""
+        try:
+            total, used, free = shutil.disk_usage(path)
+            self.logger.info(f"Espace disque pour '{path}': Total={total/(1024**3):.2f}GB, Utilisé={used/(1024**3):.2f}GB, Libre={free/(1024**3):.2f}GB")
+            return {
+                "status": "success",
+                "path": path,
+                "total_bytes": total,
+                "used_bytes": used,
+                "free_bytes": free,
+                "total_gb": round(total / (1024**3), 2),
+                "used_gb": round(used / (1024**3), 2),
+                "free_gb": round(free / (1024**3), 2)
+            }
+        except Exception as e:
+            raise FileSystemError(f"Erreur lors de la récupération de l'espace disque pour '{path}': {e}", path=path)
+
+    def _create_directory(self, path):
+        """Crée un répertoire, y compris les répertoires parents."""
+        try:
+            os.makedirs(path, exist_ok=True)
+            self.logger.info(f"Répertoire '{path}' créé ou existant.")
+            return {"status": "success", "message": f"Répertoire '{path}' créé."}
+        except Exception as e:
+            raise FileSystemError(f"Erreur lors de la création du répertoire '{path}': {e}", path=path)
+
+    def _delete_directory(self, path):
+        """Supprime un répertoire et tout son contenu."""
+        if not os.path.exists(path):
+            raise FileSystemError(f"Le répertoire '{path}' n'existe pas.", path=path)
+        try:
+            shutil.rmtree(path)
+            self.logger.info(f"Répertoire '{path}' supprimé avec succès.")
+            return {"status": "success", "message": f"Répertoire '{path}' supprimé."}
+        except Exception as e:
+            raise FileSystemError(f"Erreur lors de la suppression du répertoire '{path}': {e}", path=path)
+
+# --- Modules Génériques (inchangés du script précédent) ---
+
+class FileProcessingModule(BaseModule):
+    """Module pour le traitement de fichiers."""
+    def __init__(self, config_manager: ConfigManager):
+        super().__init__(config_manager)
+        self.input_dir = self.config.get("file_processing.input_directory", os.path.join(os.getcwd(), "input_files"))
+        self.output_dir = self.config.get("file_processing.output_directory", os.path.join(os.getcwd(), "output_files"))
+        os.makedirs(self.input_dir, exist_ok=True)
+        os.makedirs(self.output_dir, exist_ok=True)
+
+    @Utility.measure_execution_time
+    def run(self, action: str, file_path: str = None, content: str = None):
+        self.logger.info(f"Exécution de FileProcessingModule avec l'action: {action}")
+        if action == "read":
+            if not file_path:
+                raise ValidationError("Chemin du fichier requis pour l'action 'read'.")
+            return self._read_file(os.path.join(self.input_dir, file_path))
+        elif action == "write":
+            if not file_path or content is None:
+                raise ValidationError("Chemin du fichier et contenu requis pour l'action 'write'.")
+            self._write_file(os.path.join(self.output_dir, file_path), content)
+            return {"status": "success", "message": f"Fichier '{file_path}' écrit avec succès."}
+        elif action == "list":
+            return self._list_files(self.input_dir)
+        else:
+            raise AppError(f"Action '{action}' non supportée par FileProcessingModule.")
+
+    def _read_file(self, path):
+        with Utility.safe_file_operation(path, 'r') as f:
+            data = f.read()
+            self.logger.info(f"Fichier lu : {path}")
+            return data
+
+    def _write_file(self, path, content):
+        with Utility.safe_file_operation(path, 'w') as f:
+            f.write(content)
+            self.logger.info(f"Fichier écrit : {path}")
+
+    def _list_files(self, directory):
+        try:
+            files = [f for f in os.listdir(directory) if os.path.isfile(os.path.join(directory, f))]
+            self.logger.info(f"Fichiers listés dans {directory}: {files}")
+            return {"status": "success", "files": files}
+        except Exception as e:
+            raise FileSystemError(f"Impossible de lister les fichiers dans {directory}: {e}", path=directory)
+
+class NetworkModule(BaseModule):
+    """Module pour les opérations réseau (ex: requêtes HTTP)."""
+    def __init__(self, config_manager: ConfigManager):
+        super().__init__(config_manager)
+        self.api_key = self.config.get("api.key", "default_api_key")
+        self.api_endpoint = self.config.get("api.endpoint", "https://api.example.com")
+        try:
+            import requests # Importation conditionnelle
+        except ImportError:
+            raise AppError("Le module 'requests' est requis pour NetworkModule. Installez-le avec 'pip install requests'.")
+        self.requests = requests
+
+    @Utility.measure_execution_time
+    @Utility.retry_on_exception(retries=5, delay=2, exceptions=(requests.exceptions.ConnectionError, requests.exceptions.Timeout))
+    def run(self, method: str, path: str, params: dict = None, data: dict = None, headers: dict = None):
+        self.logger.info(f"Exécution de NetworkModule: {method.upper()} {self.api_endpoint}{path}")
+        url = f"{self.api_endpoint}{path}"
+        default_headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+        if headers:
+            default_headers.update(headers)
+
+        try:
+            timeout = self.config.get("performance.timeout_seconds", 30)
+            if method.lower() == 'get':
+                response = self.requests.get(url, params=params, headers=default_headers, timeout=timeout)
+            elif method.lower() == 'post':
+                response = self.requests.post(url, json=data, params=params, headers=default_headers, timeout=timeout)
+            elif method.lower() == 'put':
+                response = self.requests.put(url, json=data, params=params, headers=default_headers, timeout=timeout)
+            elif method.lower() == 'delete':
+                response = self.requests.delete(url, params=params, headers=default_headers, timeout=timeout)
+            else:
+                raise ValidationError(f"Méthode HTTP '{method}' non supportée.")
+
+            response.raise_for_status() # Lève une exception pour les codes d'état HTTP 4xx/5xx
+            self.logger.info(f"Requête réussie vers {url} avec statut {response.status_code}")
+            return {"status": "success", "data": response.json(), "status_code": response.status_code}
+        except self.requests.exceptions.HTTPError as e:
+            raise NetworkError(f"Erreur HTTP pour {url}: {e.response.status_code} - {e.response.text}", url=url, status_code=e.response.status_code)
+        except self.requests.exceptions.ConnectionError as e:
+            raise NetworkError(f"Erreur de connexion pour {url}: {e}", url=url)
+        except self.requests.exceptions.Timeout as e:
+            raise NetworkError(f"Délai d'attente dépassé pour {url}: {e}", url=url)
+        except self.requests.exceptions.RequestException as e:
+            raise NetworkError(f"Erreur générale lors de la requête vers {url}: {e}", url=url)
+
+class DataProcessingModule(BaseModule):
+    """Module pour le traitement et l'analyse de données."""
+    def __init__(self, config_manager: ConfigManager):
+        super().__init__(config_manager)
+        try:
+            import pandas as pd # Importation conditionnelle
+        except ImportError:
+            raise AppError("Le module 'pandas' est requis pour DataProcessingModule. Installez-le avec 'pip install pandas'.")
+        self.pd = pd
+
+    @Utility.measure_execution_time
+    def run(self, action: str, data, params: dict = None):
+        self.logger.info(f"Exécution de DataProcessingModule avec l'action: {action}")
+        params = params or {}
+
+        if action == "analyze_csv":
+            if not isinstance(data, str):
+                raise ValidationError("Les données doivent être un chemin de fichier CSV ou une chaîne de caractères CSV pour l'analyse.")
+            try:
+                if os.path.exists(data):
+                    df = self.pd.read_csv(data)
+                else:
+                    from io import StringIO
+                    df = self.pd.read_csv(StringIO(data))
+
+                summary = {
+                    "shape": df.shape,
+                    "columns": df.columns.tolist(),
+                    "describe": df.describe().to_dict(),
+                    "null_counts": df.isnull().sum().to_dict()
+                }
+                self.logger.info(f"Analyse CSV terminée. Forme: {df.shape}")
+                return {"status": "success", "summary": summary}
+            except Exception as e:
+                raise AppError(f"Erreur lors de l'analyse du CSV: {e}")
+
+        elif action == "transform_dataframe":
+            # Si 'data' est un chemin de fichier CSV, le lire en DataFrame
+            if isinstance(data, str) and os.path.exists(data) and data.lower().endswith('.csv'):
+                try:
+                    df = self.pd.read_csv(data)
+                    self.logger.info(f"Chargé DataFrame depuis CSV: {data}")
+                except Exception as e:
+                    raise AppError(f"Erreur lors du chargement du CSV '{data}' pour transformation: {e}")
+            elif isinstance(data, list): # Si data est une liste de dict (JSON), le convertir en DataFrame
+                try:
+                    df = self.pd.DataFrame(data)
+                    self.logger.info("Créé DataFrame à partir de données JSON/listes.")
+                except Exception as e:
+                    raise ValidationError(f"Impossible de créer un DataFrame à partir des données fournies (liste de dicts attendue): {e}")
+            elif not isinstance(data, self.pd.DataFrame):
+                raise ValidationError("Les données doivent être un chemin de fichier CSV, une liste de dictionnaires, ou un DataFrame Pandas pour la transformation.")
+            else: # C'est déjà un DataFrame
+                df = data
+
+            transformed_df = df.copy()
+            # Exemple de transformation: nettoyage des colonnes
+            if params.get("clean_columns", False):
+                transformed_df.columns = [Utility.sanitize_filename(col, replacement='_').lower() for col in transformed_df.columns]
+                self.logger.info("Colonnes nettoyées.")
+
+            # Exemple de transformation: filtrage
+            if "filter_column" in params and "filter_value" in params:
+                col = params["filter_column"]
+                val = params["filter_value"]
+                if col in transformed_df.columns:
+                    transformed_df = transformed_df[transformed_df[col] == val]
+                    self.logger.info(f"Filtrage appliqué sur la colonne '{col}' avec la valeur '{val}'.")
+                else:
+                    self.logger.warning(f"Colonne de filtrage '{col}' non trouvée.")
+
+            return {"status": "success", "data": transformed_df.to_dict(orient='records')}
+        else:
+            raise AppError(f"Action '{action}' non supportée par DataProcessingModule.")
+
+
+# --- Gestion de l'Interface Utilisateur (CLI) ---
+
+class CliApp:
+    """Gère l'interface en ligne de commande de l'application."""
+    def __init__(self, config_manager: ConfigManager, module_manager: ModuleManager):
+        self.config = config_manager
+        self.module_manager = module_manager
+        self.parser = argparse.ArgumentParser(
+            description="Un script Python ultra-complet et modulaire pour diverses tâches.",
+            formatter_class=argparse.RawTextHelpFormatter
+        )
+        self._setup_arguments()
+
+    def _setup_arguments(self):
+        """Définit les arguments de ligne de commande."""
+        self.parser.add_argument('--config', '-c', type=str, default=DEFAULT_CONFIG_PATH,
+                                 help=f'Chemin vers le fichier de configuration (par défaut: {DEFAULT_CONFIG_PATH})')
+        self.parser.add_argument('--log-level', '-l', type=str, default=self.config.get("logging.level", "INFO"),
+                                 choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
+                                 help='Niveau de journalisation (DEBUG, INFO, WARNING, ERROR, CRITICAL)')
+        self.parser.add_argument('--version', '-v', action='version',
+                                 version=f'%(prog)s {self.config.get("app.version", "1.0.0")}')
+
+        subparsers = self.parser.add_subparsers(dest='command', help='Commandes disponibles')
+
+        # Commande pour lister les modules
+        list_parser = subparsers.add_parser('list-modules', help='Liste tous les modules enregistrés.')
+
+        # Commande générale pour exécuter un module
+        run_parser = subparsers.add_parser('run', help='Exécute un module spécifique.')
+        run_parser.add_argument('module_name', type=str, help='Le nom du module à exécuter.')
+        run_parser.add_argument('action', type=str, help='L\'action à effectuer au sein du module.')
+        run_parser.add_argument('--params', type=str,
+                                help='Paramètres JSON pour le module (ex: \'{"key": "value", "another_param": true}\')',
+                                default='{}')
+        run_parser.add_argument('--data', type=str,
+                                help='Données JSON ou chemin de fichier pour le module (ex: \'{"item": 1}\' ou "path/to/file").',
+                                default='{}') # Permet de passer des données complexes ou un chemin de fichier
+
+        # Exemple de commande spécifique : gérer la configuration
+        config_parser = subparsers.add_parser('config', help='Gère la configuration de l\'application.')
+        config_subparsers = config_parser.add_subparsers(dest='config_command', help='Sous-commandes de configuration')
+
+        get_config_parser = config_subparsers.add_parser('get', help='Récupère une valeur de configuration.')
+        get_config_parser.add_argument('key_path', type=str, help='Le chemin de la clé de configuration (ex: app.name).')
+
+        set_config_parser = config_subparsers.add_parser('set', help='Définit une valeur de configuration.')
+        set_config_parser.add_argument('key_path', type=str, help='Le chemin de la clé de configuration.')
+        set_config_parser.add_argument('value', type=str, help='La nouvelle valeur pour la clé. Convertie automatiquement (int, float, bool, JSON, string).')
+
+        save_config_parser = config_subparsers.add_parser('save', help='Sauvegarde la configuration actuelle.')
+        save_config_parser.add_argument('--path', type=str, default=DEFAULT_CONFIG_PATH,
+                                        help='Chemin où sauvegarder le fichier de configuration.')
+
+    def run(self):
+        """Lance l'application CLI."""
+        args = self.parser.parse_args()
+
+        # Mettre à jour le niveau de journalisation si spécifié
+        numeric_level = getattr(logging, args.log_level.upper(), None)
+        if not isinstance(numeric_level, int):
+            raise ValueError(f'Niveau de journalisation invalide: {args.log_level}')
+        logging.getLogger().setLevel(numeric_level)
+        self.config.set("logging.level", args.log_level.upper())
+        logger.info(f"Niveau de journalisation défini sur {args.log_level.upper()}")
+
+        if args.command == 'list-modules':
+            self._handle_list_modules()
+        elif args.command == 'run':
+            self._handle_run_module(args)
+        elif args.command == 'config':
+            self._handle_config_command(args)
+        elif args.command is None:
+            self.parser.print_help()
+        else:
+            logger.error(f"Commande inconnue: {args.command}")
+            self.parser.print_help()
+
+    def _handle_list_modules(self):
+        """Gère la commande 'list-modules'."""
+        modules = self.module_manager.list_modules()
+        if modules:
+            print("\nModules enregistrés :")
+            for module in modules:
+                print(f"- {module}")
+        else:
+            print("Aucun module enregistré.")
+
+    def _handle_run_module(self, args):
+        """Gère l'exécution d'un module via la CLI."""
+        try:
+            params = json.loads(args.params)
+        except json.JSONDecodeError:
+            logger.error(f"Paramètres JSON invalides : {args.params}")
+            return
+
+        data = args.data
+        if data.startswith('{') and data.endswith('}') or data.startswith('[') and data.endswith(']'):
+            try:
+                data = json.loads(data)
+            except json.JSONDecodeError:
+                logger.error(f"Données JSON invalides : {args.data}")
+                return
+        # Si data est un chemin de fichier, le module le gérera comme tel.
+        # Sinon, c'est une chaîne de caractères simple.
+
+        try:
+            module_instance = self.module_manager.get_module_instance(args.module_name, self.config)
+            result = module_instance.run(args.action, data=data, **params) # Passer les paramètres via **params
+            print("\n--- Résultat de l'opération ---")
+            if result is not None:
+                if isinstance(result, (dict, list)):
+                    print(json.dumps(result, indent=2, ensure_ascii=False))
+                else:
+                    print(result)
+            print("------------------------------")
+        except AppError as e:
+            logger.error(f"Erreur d'application lors de l'exécution du module '{args.module_name}': {e.message} (Code: {e.code})")
+        except Exception as e:
+            logger.exception(f"Une erreur inattendue est survenue lors de l'exécution du module '{args.module_name}'.")
+
+    def _handle_config_command(self, args):
+        """Gère les commandes de configuration."""
+        if args.config_command == 'get':
+            value = self.config.get(args.key_path)
+            if value is not None:
+                print(f"La valeur de '{args.key_path}' est : {value}")
+            else:
+                print(f"La clé '{args.key_path}' n'a pas été trouvée ou est nulle.")
+        elif args.config_command == 'set':
+            # Tente de convertir la valeur en type approprié
+            value = args.value
+            if value.lower() == 'true':
+                value = True
+            elif value.lower() == 'false':
+                value = False
+            elif value.isdigit():
+                value = int(value)
+            elif value.replace('.', '', 1).isdigit(): # Check if it's a float
+                value = float(value)
+            else:
+                try:
+                    # Try to parse as JSON for dicts/lists
+                    parsed_value = json.loads(value)
+                    if isinstance(parsed_value, (dict, list)):
+                        value = parsed_value
+                except json.JSONDecodeError:
+                    pass # Keep as string if not JSON
+
+            self.config.set(args.key_path, value)
+            self.config.save_config() # Sauvegarde après chaque modification
+            print(f"La clé '{args.key_path}' a été définie à '{value}'.")
+        elif args.config_command == 'save':
+            self.config.save_config(args.path)
+            print(f"Configuration sauvegardée dans '{args.path}'.")
+        else:
+            logger.error(f"Sous-commande de configuration inconnue: {args.config_command}")
+            self.parser.print_help()
+
+
+# --- Point d'entrée principal de l'application ---
+
+def main():
+    """Fonction principale pour initialiser et lancer l'application."""
+    # 1. Initialiser le gestionnaire de configuration
+    config_manager = ConfigManager()
+
+    # 2. Initialiser le gestionnaire de modules
+    module_manager = ModuleManager()
+
+    # 3. Enregistrer les modules disponibles
+    try:
+        module_manager.register_module("file_processing", FileProcessingModule)
+        module_manager.register_module("network", NetworkModule)
+        module_manager.register_module("data_processing", DataProcessingModule)
+        module_manager.register_module("project_management", ProjectManagementModule)
+        module_manager.register_module("github", GitHubModule)
+        module_manager.register_module("cloud_deployment", CloudDeploymentModule)
+        module_manager.register_module("aws", AWSModule)
+        module_manager.register_module("system_utility", SystemUtilityModule)
+    except AppError as e:
+        logger.error(f"Erreur lors de l'enregistrement des modules: {e.message}")
+        sys.exit(1)
+    except Exception as e:
+        logger.exception("Une erreur inattendue est survenue lors de l'enregistrement des modules.")
+        sys.exit(1)
+
+
+    # 4. Lancer l'interface en ligne de commande
+    app = CliApp(config_manager, module_manager)
+    try:
+        app.run()
+    except Exception as e:
+        logger.critical(f"Une erreur critique est survenue dans l'application principale: {e}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
