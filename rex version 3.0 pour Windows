@@ -1,0 +1,1761 @@
+import os
+import sys
+import logging
+import argparse
+import json
+import yaml
+import configparser
+import datetime
+import time
+import hashlib
+import base64
+import uuid
+import re
+import math
+import random
+import secrets
+import shutil
+import subprocess
+import threading
+import multiprocessing
+import queue
+import concurrent.futures
+from collections import defaultdict, deque, Counter
+from functools import wraps, lru_cache
+from contextlib import contextmanager
+from dotenv import load_dotenv # Pour la gestion des secrets simples
+from abc import ABC, abstractmethod
+
+# --- Ajout de dépendances externes spécifiques ---
+try:
+    import requests
+except ImportError:
+    requests = None
+    logging.warning("Le module 'requests' n'est pas installé. Certaines fonctionnalités réseau seront limitées.")
+
+try:
+    import boto3
+    from botocore.exceptions import ClientError as BotoClientError
+except ImportError:
+    boto3 = None
+    BotoClientError = type('BotoClientError', (Exception,), {}) # Mock l'exception
+    logging.warning("Le module 'boto3' n'est pas installé. Les fonctionnalités AWS seront limitées.")
+
+try:
+    import pandas as pd
+except ImportError:
+    pd = None
+    logging.warning("Le module 'pandas' n'est pas installé. Les fonctionnalités de traitement de données avancées seront limitées.")
+
+try:
+    from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text, Boolean, func
+    from sqlalchemy.orm import sessionmaker, declarative_base
+    from sqlalchemy.exc import SQLAlchemyError
+except ImportError:
+    create_engine = Column = Integer = String = DateTime = Text = Boolean = func = None
+    sessionmaker = declarative_base = type('declarative_base', (object,), {})()
+    SQLAlchemyError = type('SQLAlchemyError', (Exception,), {})
+    logging.warning("SQLAlchemy n'est pas installé. La persistance de la base de données sera désactivée.")
+
+try:
+    from apscheduler.schedulers.background import BackgroundScheduler
+    from apscheduler.triggers.interval import IntervalTrigger
+    from apscheduler.triggers.cron import CronTrigger
+except ImportError:
+    BackgroundScheduler = IntervalTrigger = CronTrigger = None
+    logging.warning("APScheduler n'est pas installé. La planification de tâches sera désactivée.")
+
+try:
+    from fastapi import FastAPI, Depends, HTTPException, status
+    from fastapi.responses import JSONResponse
+    import uvicorn
+except ImportError:
+    FastAPI = Depends = HTTPException = status = JSONResponse = uvicorn = None
+    logging.warning("FastAPI/Uvicorn ne sont pas installés. L'API Web sera désactivée.")
+
+try:
+    from prometheus_client import start_http_server, Counter as PromCounter, Gauge as PromGauge, Histogram as PromHistogram
+except ImportError:
+    start_http_server = PromCounter = PromGauge = PromHistogram = None
+    logging.warning("Prometheus client n'est pas installé. Le monitoring sera désactivé.")
+
+
+# --- Configuration Globale et Initialisation ---
+
+# Charger les variables d'environnement dès le début
+load_dotenv()
+
+DEFAULT_CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'config.json')
+DEFAULT_LOG_LEVEL = logging.INFO
+LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+LOG_DIR = os.path.join(os.path.dirname(__file__), 'logs')
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_FILE = os.path.join(LOG_DIR, f'app_{datetime.date.today().strftime("%Y-%m-%d")}.log')
+
+# Configuration de base pour le journalisation
+logging.basicConfig(level=DEFAULT_LOG_LEVEL, format=LOG_FORMAT, handlers=[
+    logging.FileHandler(LOG_FILE),
+    logging.StreamHandler(sys.stdout)
+])
+logger = logging.getLogger(__name__)
+
+
+# --- NOUVEAU : Gestion des Secrets ---
+class SecretManager:
+    """Gère l'accès aux secrets (variables d'environnement, Vault, etc.)."""
+    _instance = None
+    _secrets_cache = {}
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super(SecretManager, cls).__new__(cls)
+        return cls._instance
+
+    def get_secret(self, key: str, default=None):
+        """
+        Récupère un secret. Priorise les variables d'environnement.
+        Peut être étendu pour intégrer Vault, AWS Secrets Manager, etc.
+        """
+        if key in self._secrets_cache:
+            return self._secrets_cache[key]
+
+        # 1. Tenter de récupérer depuis les variables d'environnement
+        value = os.getenv(key)
+        if value is not None:
+            self._secrets_cache[key] = value
+            return value
+
+        # 2. TODO: Ajouter la logique pour les systèmes de gestion de secrets plus robustes
+        # Ex: Intégration avec HashiCorp Vault, AWS Secrets Manager, Azure Key Vault
+        # if self.config.get("security.secrets_backend") == "vault":
+        #    return self._get_from_vault(key)
+        # elif self.config.get("security.secrets_backend") == "aws_secrets_manager":
+        #    return self._get_from_aws(key)
+
+        logger.warning(f"Secret '{key}' non trouvé dans l'environnement. Utilisation de la valeur par défaut.")
+        return default
+
+    def set_secret(self, key: str, value: str):
+        """Définit un secret (pour les tests ou les variables d'env temporaires)."""
+        os.environ[key] = value
+        self._secrets_cache[key] = value
+        logger.debug(f"Secret '{key}' défini (dans l'environnement pour cette session).")
+
+
+# --- NOUVEAU : Base de Données (SQLAlchemy) ---
+Base = declarative_base() if declarative_base else None
+
+class AppLogEntry(Base):
+    """Modèle pour stocker les entrées de log importantes dans la base de données."""
+    __tablename__ = 'app_logs'
+    id = Column(Integer, primary_key=True)
+    timestamp = Column(DateTime, default=func.now())
+    level = Column(String(50))
+    logger_name = Column(String(255))
+    message = Column(Text)
+    module_name = Column(String(255), nullable=True)
+    action_name = Column(String(255), nullable=True)
+    status = Column(String(50), nullable=True) # success, error, skipped
+
+    def __repr__(self):
+        return f"<LogEntry(id={self.id}, level='{self.level}', message='{self.message[:50]}...')>"
+
+class TaskSchedule(Base):
+    """Modèle pour stocker les tâches planifiées de l'application."""
+    __tablename__ = 'task_schedules'
+    id = Column(Integer, primary_key=True)
+    task_name = Column(String(255), unique=True, nullable=False)
+    module_name = Column(String(255), nullable=False)
+    action_name = Column(String(255), nullable=False)
+    params_json = Column(Text, nullable=True) # JSON string of parameters
+    trigger_type = Column(String(50), nullable=False) # e.g., interval, cron
+    trigger_config_json = Column(Text, nullable=False) # JSON string of trigger config (e.g., {"minutes": 5} or {"hour": 3})
+    enabled = Column(Boolean, default=True)
+    last_run_time = Column(DateTime, nullable=True)
+    next_run_time = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+    def __repr__(self):
+        return f"<TaskSchedule(name='{self.task_name}', module='{self.module_name}', action='{self.action_name}')>"
+
+class DatabaseManager:
+    """Gère la connexion et les opérations de base de données."""
+    _instance = None
+    _engine = None
+    _Session = None
+
+    def __new__(cls, db_path: str = "data.db"):
+        if not SQLAlchemyError: # Si SQLAlchemy n'est pas installé
+            logger.error("SQLAlchemy n'est pas installé. Impossible d'initialiser le gestionnaire de base de données.")
+            return None # Retourne None pour éviter les erreurs subséquentes
+
+        if cls._instance is None:
+            cls._instance = super(DatabaseManager, cls).__new__(cls)
+            cls._instance._init_db(db_path)
+        return cls._instance
+
+    def _init_db(self, db_path):
+        """Initialise le moteur et la session de base de données."""
+        try:
+            self._engine = create_engine(f'sqlite:///{db_path}')
+            Base.metadata.create_all(self._engine) # Crée toutes les tables si elles n'existent pas
+            self._Session = sessionmaker(bind=self._engine)
+            logger.info(f"Base de données SQLite initialisée à : {db_path}")
+        except SQLAlchemyError as e:
+            logger.critical(f"Erreur lors de l'initialisation de la base de données : {e}")
+            self._engine = None # S'assure que le manager est non fonctionnel
+            self._Session = None
+        except Exception as e:
+            logger.critical(f"Erreur inattendue lors de l'initialisation de la base de données : {e}")
+            self._engine = None
+            self._Session = None
+
+    @contextmanager
+    def get_session(self):
+        """Fournit une session de base de données via un contexte manager."""
+        if not self._Session:
+            raise AppError("La base de données n'est pas initialisée ou a échoué à l'initialisation.")
+        session = self._Session()
+        try:
+            yield session
+            session.commit()
+        except SQLAlchemyError as e:
+            session.rollback()
+            raise AppError(f"Erreur de base de données : {e}")
+        finally:
+            session.close()
+
+    def log_operation(self, level, message, module_name=None, action_name=None, status=None):
+        """Enregistre une opération dans la table de logs."""
+        if not self._Session: return # Ne rien faire si la DB n'est pas active
+        try:
+            with self.get_session() as session:
+                log_entry = AppLogEntry(
+                    level=level,
+                    message=message,
+                    logger_name="App", # Ou le nom du logger appelant
+                    module_name=module_name,
+                    action_name=action_name,
+                    status=status
+                )
+                session.add(log_entry)
+            logger.debug(f"Opération loggée en DB: {message}")
+        except AppError as e:
+            logger.error(f"Impossible de logguer en DB: {e.message}")
+        except Exception as e:
+            logger.error(f"Erreur inattendue lors de la journalisation en DB: {e}")
+
+# --- Classes de Base et Utilitaires ---
+
+class ConfigManager:
+    """Gère le chargement et l'accès à la configuration de l'application."""
+    _instance = None
+    _config = {}
+
+    def __new__(cls, config_path=DEFAULT_CONFIG_PATH):
+        if cls._instance is None:
+            cls._instance = super(ConfigManager, cls).__new__(cls)
+            cls._instance._load_config(config_path)
+        return cls._instance
+
+    def _load_config(self, config_path):
+        """Charge la configuration depuis un fichier JSON, YAML ou INI."""
+        try:
+            if not os.path.exists(config_path):
+                logger.warning(f"Fichier de configuration non trouvé à : {config_path}. Utilisation d'une configuration par défaut.")
+                self._config = self._get_default_config()
+                self.save_config(config_path) # Sauve la config par défaut
+                return
+
+            ext = os.path.splitext(config_path)[1].lower()
+            if ext == '.json':
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    self._config = json.load(f)
+            elif ext == '.yaml' or ext == '.yml':
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    self._config = yaml.safe_load(f)
+            elif ext == '.ini':
+                config_parser = configparser.ConfigParser()
+                config_parser.read(config_path)
+                self._config = {section: dict(config_parser[section]) for section in config_parser.sections()}
+            else:
+                logger.error(f"Format de fichier de configuration non supporté : {ext}")
+                self._config = self._get_default_config()
+
+            logger.info(f"Configuration chargée depuis {config_path}")
+        except Exception as e:
+            logger.error(f"Erreur lors du chargement de la configuration depuis {config_path}: {e}")
+            self._config = self._get_default_config()
+
+    def _get_default_config(self):
+        """Retourne une configuration par défaut."""
+        return {
+            "app": {
+                "name": "ScriptOmniscient",
+                "version": "2.0.0-alpha", # Nouvelle version !
+                "environment": "development"
+            },
+            "logging": {
+                "level": "INFO",
+                "file": LOG_FILE,
+                "format": LOG_FORMAT
+            },
+            "database": {
+                "type": "sqlite",
+                "path": "data.db"
+            },
+            "api": {
+                "endpoint": "https://api.example.com"
+            },
+            "performance": {
+                "max_threads": os.cpu_count() * 2,
+                "timeout_seconds": 30
+            },
+            "security": {
+                "salt_length": 16,
+                "hashing_rounds": 100000,
+                "secrets_backend": "environment" # ou "vault", "aws_secrets_manager"
+            },
+            "project_templates": {
+                "web": "https://github.com/your-org/web-template.git",
+                "backend": "https://github.com/your-org/backend-template.git",
+                "mobile": "https://github.com/your-org/mobile-template.git"
+            },
+            "github": {
+                "username": "your_github_username"
+            },
+            "aws": {
+                "region": "eu-west-3"
+            },
+            "web_api": {
+                "host": "127.0.0.1",
+                "port": 8000
+            },
+            "prometheus": {
+                "port": 8001
+            }
+            # Note: Les tokens sont maintenant des secrets via SecretManager
+        }
+
+    def get(self, key_path, default=None):
+        """
+        Récupère une valeur de configuration en utilisant un chemin de clé (ex: "app.name").
+        """
+        keys = key_path.split('.')
+        value = self._config
+        try:
+            for key in keys:
+                value = value[key]
+            return value
+        except KeyError:
+            logger.warning(f"Clé de configuration '{key_path}' non trouvée. Retourne la valeur par défaut : {default}")
+            return default
+
+    def set(self, key_path, value):
+        """Définit une valeur de configuration en utilisant un chemin de clé."""
+        keys = key_path.split('.')
+        config_node = self._config
+        for i, key in enumerate(keys):
+            if i == len(keys) - 1:
+                config_node[key] = value
+            else:
+                if key not in config_node or not isinstance(config_node[key], dict):
+                    config_node[key] = {}
+                config_node = config_node[key]
+        logger.info(f"Configuration mise à jour: {key_path} = {value}")
+
+    def save_config(self, config_path=DEFAULT_CONFIG_PATH):
+        """Sauvegarde la configuration actuelle dans un fichier JSON."""
+        try:
+            with open(config_path, 'w', encoding='utf-8') as f:
+                json.dump(self._config, f, indent=4)
+            logger.info(f"Configuration sauvegardée dans {config_path}")
+        except Exception as e:
+            logger.error(f"Erreur lors de la sauvegarde de la configuration dans {config_path}: {e}")
+
+class AppError(Exception):
+    """Classe de base pour les erreurs spécifiques à l'application."""
+    def __init__(self, message="Une erreur est survenue dans l'application.", code=500):
+        super().__init__(message)
+        self.message = message
+        self.code = code
+        db_manager = DatabaseManager() # Tente de logguer en DB
+        if db_manager:
+            db_manager.log_operation(level="ERROR", message=message, status="failed")
+        logger.error(f"AppError [{self.code}]: {self.message}")
+
+class ValidationError(AppError):
+    """Erreur de validation des données."""
+    def __init__(self, message="Erreur de validation des données.", field=None, code=400):
+        super().__init__(message, code)
+        self.field = field
+
+class NetworkError(AppError):
+    """Erreur liée au réseau."""
+    def __init__(self, message="Erreur réseau.", url=None, status_code=None, code=503):
+        super().__init__(message, code)
+        self.url = url
+        self.status_code = status_code
+
+class FileSystemError(AppError):
+    """Erreur liée au système de fichiers."""
+    def __init__(self, message="Erreur du système de fichiers.", path=None, code=500):
+        super().__init__(message, code)
+        self.path = path
+
+class ExternalCommandError(AppError):
+    """Erreur lors de l'exécution d'une commande externe."""
+    def __init__(self, message="Erreur d'exécution de commande externe.", command=None, return_code=None, stdout=None, stderr=None, code=500):
+        super().__init__(message, code)
+        self.command = command
+        self.return_code = return_code
+        self.stdout = stdout
+        self.stderr = stderr
+        logger.error(f"Commande '{self.command}' a échoué avec le code {self.return_code}.\nStderr: {self.stderr}")
+
+class Utility:
+    """Classe utilitaire pour des fonctions diverses."""
+
+    @staticmethod
+    def hash_data(data: str, algorithm='sha256') -> str:
+        """Hache une chaîne de caractères."""
+        try:
+            hasher = hashlib.new(algorithm)
+            hasher.update(data.encode('utf-8'))
+            return hasher.hexdigest()
+        except ValueError:
+            raise AppError(f"Algorithme de hachage '{algorithm}' non supporté.")
+        except Exception as e:
+            raise AppError(f"Erreur lors du hachage des données : {e}")
+
+    @staticmethod
+    def generate_uuid() -> str:
+        """Génère un UUID v4."""
+        return str(uuid.uuid4())
+
+    @staticmethod
+    def base64_encode(data: str) -> str:
+        """Encode une chaîne en Base64."""
+        return base64.b64encode(data.encode('utf-8')).decode('utf-8')
+
+    @staticmethod
+    def base64_decode(data: str) -> str:
+        """Décode une chaîne Base64."""
+        try:
+            return base64.b64decode(data.encode('utf-8')).decode('utf-8')
+        except Exception as e:
+            raise ValidationError(f"Données Base64 invalides : {e}")
+
+    @staticmethod
+    def sanitize_filename(filename: str, replacement='_') -> str:
+        """Assainit un nom de fichier pour le rendre sûr."""
+        return re.sub(r'[<>:"/\\|?*]', replacement, filename)
+
+    @staticmethod
+    def measure_execution_time(func):
+        """Décorateur pour mesurer le temps d'exécution d'une fonction."""
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            start_time = time.perf_counter()
+            result = func(*args, **kwargs)
+            end_time = time.perf_counter()
+            duration = end_time - start_time
+            logger.debug(f"Fonction '{func.__name__}' exécutée en {duration:.4f} secondes.")
+            # NOUVEAU: Mettre à jour les métriques Prometheus
+            if Utility.metrics and Utility.metrics.execution_time_histogram:
+                Utility.metrics.execution_time_histogram.labels(func.__name__).observe(duration)
+            return result
+        return wrapper
+
+    @staticmethod
+    @contextmanager
+    def safe_file_operation(file_path, mode='r', encoding='utf-8'):
+        """Contexte manager pour des opérations de fichier sûres."""
+        file_obj = None
+        try:
+            file_obj = open(file_path, mode, encoding=encoding)
+            yield file_obj
+        except FileNotFoundError:
+            raise FileSystemError(f"Fichier non trouvé : {file_path}", path=file_path)
+        except PermissionError:
+            raise FileSystemError(f"Permission refusée pour le fichier : {file_path}", path=file_path)
+        except Exception as e:
+            raise FileSystemError(f"Erreur lors de l'opération sur le fichier {file_path}: {e}", path=file_path)
+        finally:
+            if file_obj:
+                file_obj.close()
+
+    @staticmethod
+    def retry_on_exception(retries=3, delay=1, backoff_factor=2, exceptions=(Exception,)):
+        """Décorateur pour réessayer une fonction en cas d'exception."""
+        def decorator(func):
+            @wraps(func)
+            def wrapper(*args, **kwargs):
+                _retries = retries
+                _delay = delay
+                while _retries > 0:
+                    try:
+                        return func(*args, **kwargs)
+                    except exceptions as e:
+                        logger.warning(f"Tentative échouée pour '{func.__name__}': {e}. Nouvelle tentative dans {_delay:.2f}s...")
+                        _retries -= 1
+                        if Utility.metrics and Utility.metrics.retries_counter:
+                            Utility.metrics.retries_counter.labels(func.__name__).inc()
+                        if _retries > 0:
+                            time.sleep(_delay)
+                            _delay *= backoff_factor
+                raise AppError(f"La fonction '{func.__name__}' a échoué après {retries} tentatives.")
+            return wrapper
+        return decorator
+
+    @staticmethod
+    def execute_command(command, cwd=None, shell=False, capture_output=True, check=True):
+        """Exécute une commande shell et gère les erreurs."""
+        logger.debug(f"Exécution de la commande: {' '.join(command) if isinstance(command, list) else command} dans {cwd if cwd else 'CWD'}")
+        try:
+            result = subprocess.run(
+                command,
+                cwd=cwd,
+                shell=shell,
+                capture_output=capture_output,
+                text=True, # Décode stdout/stderr en texte
+                check=check # Lève CalledProcessError si le code de retour est non nul
+            )
+            if check and result.returncode != 0:
+                raise ExternalCommandError(
+                    f"Commande '{command}' a échoué.",
+                    command=command,
+                    return_code=result.returncode,
+                    stdout=result.stdout,
+                    stderr=result.stderr
+                )
+            logger.info(f"Commande réussie: {command}")
+            if capture_output:
+                return result.stdout.strip()
+            return True
+        except FileNotFoundError:
+            raise ExternalCommandError(f"Commande '{command[0] if isinstance(command, list) else command.split(' ')[0]}' non trouvée. Assurez-vous qu'elle est installée et dans le PATH.", command=command)
+        except ExternalCommandError: # Re-raise nos exceptions
+            raise
+        except Exception as e:
+            raise ExternalCommandError(f"Erreur inattendue lors de l'exécution de la commande '{command}': {e}", command=command)
+
+Utility.metrics = None # Sera initialisé par MetricsManager
+
+
+# --- NOUVEAU : Gestion des Métriques (Prometheus) ---
+class MetricsManager:
+    """Gère l'exposition des métriques Prometheus."""
+    _instance = None
+    def __new__(cls, port: int = 8001):
+        if cls._instance is None:
+            cls._instance = super(MetricsManager, cls).__new__(cls)
+            if start_http_server:
+                try:
+                    start_http_server(port)
+                    logger.info(f"Serveur Prometheus démarré sur le port {port}")
+                    cls._instance.requests_total = PromCounter('app_requests_total', 'Total number of app requests', ['module', 'action', 'status'])
+                    cls._instance.execution_time_histogram = PromHistogram('app_function_duration_seconds', 'Function execution duration in seconds', ['function_name'])
+                    cls._instance.retries_counter = PromCounter('app_retries_total', 'Total number of retries', ['function_name'])
+                    cls._instance.current_tasks_gauge = PromGauge('app_current_tasks', 'Current number of active tasks', ['module'])
+                    Utility.metrics = cls._instance # Attacher l'instance de métriques à Utility
+                except Exception as e:
+                    logger.error(f"Impossible de démarrer le serveur Prometheus : {e}")
+                    cls._instance = None # Désactiver si le démarrage échoue
+            else:
+                logger.warning("Prometheus client non disponible. Les métriques ne seront pas exposées.")
+                cls._instance = None
+        return cls._instance
+
+
+# --- Gestion des Modules et Plugins ---
+
+class ModuleManager:
+    """Gère le chargement, l'enregistrement et l'exécution des modules."""
+    _modules = {}
+
+    def __init__(self, config_manager, db_manager, secret_manager, scheduler=None):
+        self.config = config_manager
+        self.db_manager = db_manager
+        self.secret_manager = secret_manager
+        self.scheduler = scheduler # NOUVEAU: Référence au scheduler
+
+    def register_module(self, name: str, module_class: type):
+        """Enregistre un module avec un nom donné."""
+        if not issubclass(module_class, BaseModule):
+            raise TypeError("Le module doit hériter de BaseModule.")
+        if name in self._modules:
+            logger.warning(f"Le module '{name}' est déjà enregistré et sera remplacé.")
+        self._modules[name] = module_class
+        logger.info(f"Module '{name}' enregistré.")
+
+    def get_module_instance(self, name: str):
+        """Retourne une instance d'un module enregistré."""
+        module_class = self._modules.get(name)
+        if not module_class:
+            raise AppError(f"Le module '{name}' n'est pas enregistré.")
+        return module_class(self.config, self.db_manager, self.secret_manager)
+
+    def list_modules(self):
+        """Liste tous les modules enregistrés."""
+        return list(self._modules.keys())
+
+    def execute_module_action(self, module_name: str, action_name: str, data: dict = None, params: dict = None):
+        """Méthode unifiée pour exécuter une action de module."""
+        module_instance = None
+        result = None
+        status = "failed" # Statut par défaut
+        try:
+            if Utility.metrics and Utility.metrics.current_tasks_gauge:
+                Utility.metrics.current_tasks_gauge.labels(module_name).inc()
+
+            module_instance = self.get_module_instance(module_name)
+            self.db_manager.log_operation("INFO", f"Exécution de {module_name}.{action_name}", module_name, action_name, "started")
+            logger.info(f"Exécution du module '{module_name}' action '{action_name}'...")
+
+            # Assurer que 'data' est toujours un dict si non fourni pour les modules
+            if data is None:
+                data = {}
+            if params is None:
+                params = {}
+
+            # NOUVEAU : Gérer le passage de 'data' comme argument nommé pour certains modules
+            if module_name in ["network", "data_processing"]:
+                 result = module_instance.run(action_name, data=data, **params)
+            elif module_name == "project_management" and action_name in ["create", "delete", "init_git", "install_deps"]:
+                 # Project management prend project_name, template_type, etc. directement en params
+                 # data n'est pas directement utilisé ici, mais peut être parsé depuis params si besoin
+                 # Exemple: {"project_name": "MyNewProject", "template_type": "web"}
+                 result = module_instance.run(action_name, **params)
+            elif module_name == "github" and action_name in ["create_repo", "push_initial"]:
+                 # GitHub prend repo_name, org_name, project_path etc. directement en params
+                 result = module_instance.run(action_name, **params)
+            elif module_name == "cloud_deployment" and action_name in ["deploy", "connect_domain"]:
+                 # Cloud Deployment prend platform, project_path, project_name etc. directement en params
+                 result = module_instance.run(action_name, **params)
+            elif module_name == "aws" and action_name in ["create_bucket", "upload_file", "download_file", "list_objects", "delete_object", "delete_bucket"]:
+                 # AWS prend service, bucket_name, file_path etc. directement en params
+                 service = params.pop("service", None) # Le service est un paramètre spécial pour AWS
+                 if not service:
+                     raise ValidationError("Le paramètre 'service' est requis pour les opérations AWS.")
+                 result = module_instance.run(action_name, service=service, **params)
+            elif module_name == "system_utility" and action_name in ["clean_logs", "get_disk_space", "create_dir", "delete_dir"]:
+                 result = module_instance.run(action_name, **params)
+            elif module_name == "scheduler" and action_name in ["add_job", "remove_job", "list_jobs", "start", "shutdown"]:
+                 # Le module scheduler gérera ses propres paramètres
+                 result = module_instance.run(action_name, **params)
+            else:
+                 # Par défaut, essayer de passer les params et data comme arguments nommés
+                 result = module_instance.run(action_name, **data, **params) # Tente de décompresser data et params
+
+            status = "success"
+            self.db_manager.log_operation("INFO", f"Exécution de {module_name}.{action_name} réussie.", module_name, action_name, status)
+            if Utility.metrics and Utility.metrics.requests_total:
+                Utility.metrics.requests_total.labels(module_name, action_name, status).inc()
+            return result
+        except AppError as e:
+            self.db_manager.log_operation("ERROR", f"Exécution de {module_name}.{action_name} échouée: {e.message}", module_name, action_name, "failed")
+            if Utility.metrics and Utility.metrics.requests_total:
+                Utility.metrics.requests_total.labels(module_name, action_name, "failed").inc()
+            raise # Re-lancer l'exception après la journalisation
+        except Exception as e:
+            self.db_manager.log_operation("CRITICAL", f"Erreur inattendue lors de l'exécution de {module_name}.{action_name}: {e}", module_name, action_name, "error")
+            if Utility.metrics and Utility.metrics.requests_total:
+                Utility.metrics.requests_total.labels(module_name, action_name, "error").inc()
+            raise # Re-lancer l'exception après la journalisation
+        finally:
+            if Utility.metrics and Utility.metrics.current_tasks_gauge:
+                Utility.metrics.current_tasks_gauge.labels(module_name).dec()
+
+
+class BaseModule(ABC): # NOUVEAU: ABCE pour les méthodes abstraites
+    """Classe de base abstraite pour tous les modules de l'application."""
+    def __init__(self, config_manager: ConfigManager, db_manager: DatabaseManager, secret_manager: SecretManager):
+        self.config = config_manager
+        self.db_manager = db_manager
+        self.secrets = secret_manager
+        self.logger = logging.getLogger(self.__class__.__name__)
+        self.logger.info(f"Module '{self.__class__.__name__}' initialisé.")
+
+    @abstractmethod
+    def run(self, action: str, **kwargs):
+        """Méthode principale abstraite à implémenter par les modules spécifiques."""
+        pass
+
+    def configure(self, *args, **kwargs):
+        """Méthode optionnelle pour la configuration du module."""
+        self.logger.debug(f"Configuration du module '{self.__class__.__name__}'.")
+
+# --- Modules Spécifiques (Basés sur l'ancien script, intégrés au nouveau framework) ---
+
+class ProjectManagementModule(BaseModule):
+    """Module pour la création et la gestion de projets (localement)."""
+    def __init__(self, config_manager: ConfigManager, db_manager: DatabaseManager, secret_manager: SecretManager):
+        super().__init__(config_manager, db_manager, secret_manager)
+        self.base_project_dir = os.path.join(os.getcwd(), self.config.get("project_management.base_dir", "projects"))
+        os.makedirs(self.base_project_dir, exist_ok=True)
+        self.templates = self.config.get("project_templates", {})
+
+    @Utility.measure_execution_time
+    def run(self, action: str, project_name: str = None, template_type: str = None, vcs_init: bool = False, install_deps: bool = False, **kwargs):
+        if not project_name:
+            raise ValidationError("Le paramètre 'project_name' est requis pour les actions de gestion de projet.")
+
+        self.logger.info(f"Exécution de ProjectManagementModule pour le projet '{project_name}' avec l'action: {action}")
+        project_path = os.path.join(self.base_project_dir, project_name)
+
+        if action == "create":
+            if os.path.exists(project_path):
+                raise FileSystemError(f"Le projet '{project_name}' existe déjà à '{project_path}'.")
+            self._create_project(project_path, template_type)
+            if vcs_init:
+                self._init_git_repo(project_path)
+            if install_deps:
+                self._install_dependencies(project_path, template_type)
+            return {"status": "success", "message": f"Projet '{project_name}' créé avec succès à {project_path}."}
+        elif action == "delete":
+            return self._delete_project(project_path)
+        elif action == "init_git":
+            return self._init_git_repo(project_path)
+        elif action == "install_deps":
+            return self._install_dependencies(project_path, template_type)
+        else:
+            raise AppError(f"Action '{action}' non supportée par ProjectManagementModule.")
+
+    # ... (les méthodes privées _create_project, _delete_project, _init_git_repo, _install_dependencies restent identiques)
+    def _create_project(self, project_path, template_type):
+        if template_type:
+            template_url = self.templates.get(template_type)
+            if not template_url:
+                raise ValidationError(f"Type de template '{template_type}' non configuré. Templates disponibles: {list(self.templates.keys())}")
+            self.logger.info(f"Clonage du template '{template_type}' depuis '{template_url}' vers '{project_path}'...")
+            Utility.execute_command(["git", "clone", template_url, project_path])
+        else:
+            os.makedirs(project_path)
+            self.logger.info(f"Dossier de projet '{project_path}' créé.")
+            with Utility.safe_file_operation(os.path.join(project_path, "README.md"), 'w') as f:
+                f.write(f"# Projet {os.path.basename(project_path)}\n\nDescription de votre nouveau projet.")
+        self.logger.info(f"Projet '{os.path.basename(project_path)}' créé à {project_path}.")
+
+    def _delete_project(self, project_path):
+        if not os.path.exists(project_path):
+            raise FileSystemError(f"Le projet '{os.path.basename(project_path)}' n'existe pas à '{project_path}'.")
+        shutil.rmtree(project_path)
+        self.logger.info(f"Projet '{os.path.basename(project_path)}' supprimé de {project_path}.")
+        return {"status": "success", "message": f"Projet '{os.path.basename(project_path)}' supprimé."}
+
+    def _init_git_repo(self, project_path):
+        self.logger.info(f"Initialisation du dépôt Git dans '{project_path}'...")
+        if not os.path.exists(os.path.join(project_path, ".git")):
+            Utility.execute_command(["git", "init"], cwd=project_path)
+            with Utility.safe_file_operation(os.path.join(project_path, ".gitignore"), 'w') as f:
+                f.write("__pycache__/\n*.pyc\n.env\nnod_modules/\nbuild/\ndist/\n")
+            self.logger.info("Dépôt Git initialisé et .gitignore créé.")
+        else:
+            self.logger.info("Dépôt Git déjà existant. Skipping initialization.")
+        return {"status": "success", "message": "Dépôt Git initialisé."}
+
+    def _install_dependencies(self, project_path, template_type):
+        self.logger.info(f"Installation des dépendances pour '{project_path}' (type: {template_type})...")
+        if template_type == "web":
+            Utility.execute_command(["npm", "install"], cwd=project_path)
+            self.logger.info("Dépendances npm installées.")
+        elif template_type == "backend":
+            Utility.execute_command([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"], cwd=project_path)
+            self.logger.info("Dépendances Python installées.")
+        else:
+            self.logger.warning(f"Pas de méthode d'installation de dépendances définie pour le type de template '{template_type}'. Skipping.")
+        return {"status": "success", "message": "Dépendances installées si applicable."}
+
+
+class GitHubModule(BaseModule):
+    """Module pour les opérations GitHub (création de dépôt, push)."""
+    def __init__(self, config_manager: ConfigManager, db_manager: DatabaseManager, secret_manager: SecretManager):
+        super().__init__(config_manager, db_manager, secret_manager)
+        if not requests:
+            raise AppError("Le module 'requests' est requis pour GitHubModule.")
+        self.requests = requests
+        self.github_username = self.config.get("github.username")
+        # NOUVEAU: Récupération du token via SecretManager
+        self.github_token = self.secrets.get_secret("GITHUB_TOKEN")
+        if not self.github_username or not self.github_token:
+            self.logger.warning("Nom d'utilisateur ou token GitHub non configuré. Certaines fonctions peuvent échouer.")
+        self.github_api_url = "https://api.github.com"
+
+    @Utility.measure_execution_time
+    @Utility.retry_on_exception(retries=3, delay=5, exceptions=(NetworkError, requests.exceptions.ConnectionError))
+    def run(self, action: str, repo_name: str, org_name: str = None, project_path: str = None, private: bool = True, **kwargs):
+        self.logger.info(f"Exécution de GitHubModule pour le dépôt '{repo_name}' avec l'action: {action}")
+
+        if action == "create_repo":
+            return self._create_github_repo(repo_name, org_name, private)
+        elif action == "push_initial":
+            if not project_path:
+                raise ValidationError("Chemin du projet local requis pour l'action 'push_initial'.")
+            return self._push_initial_commit(repo_name, project_path, org_name)
+        else:
+            raise AppError(f"Action '{action}' non supportée par GitHubModule.")
+
+    # ... (_create_github_repo et _push_initial_commit restent identiques, sauf pour l'usage de self.github_token)
+    def _create_github_repo(self, repo_name: str, org_name: str = None, private: bool = True):
+        headers = {
+            "Authorization": f"token {self.github_token}",
+            "Accept": "application/vnd.github.v3+json"
+        }
+        data = {
+            "name": repo_name,
+            "private": private,
+            "auto_init": False
+        }
+        url = f"{self.github_api_url}/user/repos"
+        if org_name:
+            url = f"{self.github_api_url}/orgs/{org_name}/repos"
+            self.logger.info(f"Création d'un dépôt dans l'organisation GitHub: {org_name}")
+
+        self.logger.info(f"Création du dépôt GitHub '{repo_name}'...")
+        try:
+            response = self.requests.post(url, headers=headers, json=data)
+            response.raise_for_status()
+            repo_data = response.json()
+            self.logger.info(f"Dépôt GitHub '{repo_name}' créé : {repo_data['html_url']}")
+            return {"status": "success", "message": f"Dépôt créé : {repo_data['html_url']}", "url": repo_data['html_url']}
+        except self.requests.exceptions.HTTPError as e:
+            if e.response.status_code == 422 and "name already exists" in e.response.text:
+                self.logger.warning(f"Dépôt '{repo_name}' existe déjà sur GitHub. Skipping creation.")
+                return {"status": "skipped", "message": f"Dépôt '{repo_name}' existe déjà."}
+            raise NetworkError(f"Erreur HTTP lors de la création du dépôt GitHub: {e.response.status_code} - {e.response.text}", url=url, status_code=e.response.status_code)
+        except Exception as e:
+            raise AppError(f"Erreur lors de la création du dépôt GitHub: {e}")
+
+    def _push_initial_commit(self, repo_name: str, project_path: str, org_name: str = None):
+        repo_url = f"https://github.com/{org_name if org_name else self.github_username}/{repo_name}.git"
+        self.logger.info(f"Configuration du dépôt distant et push initial pour '{project_path}' vers '{repo_url}'...")
+
+        try:
+            if not os.path.exists(os.path.join(project_path, ".git")):
+                raise FileSystemError(f"Le dossier '{project_path}' n'est pas un dépôt Git initialisé. Exécutez 'project_management create' avec vcs_init=True ou 'project_management init_git'.")
+
+            Utility.execute_command(["git", "remote", "add", "origin", repo_url], cwd=project_path)
+            Utility.execute_command(["git", "branch", "-M", "main"], cwd=project_path)
+            Utility.execute_command(["git", "add", "."], cwd=project_path)
+            Utility.execute_command(["git", "commit", "-m", "Initial commit from ScriptOmniscient"], cwd=project_path)
+            Utility.execute_command(["git", "push", "-u", "origin", "main"], cwd=project_path)
+
+            self.logger.info(f"Push initial réussi pour le dépôt '{repo_name}'.")
+            return {"status": "success", "message": "Push initial vers GitHub réussi.", "repo_url": repo_url}
+        except ExternalCommandError:
+            raise
+        except FileSystemError:
+            raise
+        except Exception as e:
+            raise AppError(f"Erreur lors du push initial vers GitHub: {e}")
+
+
+class CloudDeploymentModule(BaseModule):
+    """Module pour le déploiement sur des plateformes cloud (ex: Vercel, Netlify)."""
+    def __init__(self, config_manager: ConfigManager, db_manager: DatabaseManager, secret_manager: SecretManager):
+        super().__init__(config_manager, db_manager, secret_manager)
+        if not requests:
+            raise AppError("Le module 'requests' est requis pour CloudDeploymentModule.")
+        self.requests = requests
+        # NOUVEAU: Récupération du token Vercel via SecretManager
+        self.vercel_token = self.secrets.get_secret("VERCEL_TOKEN")
+        if not self.vercel_token:
+            self.logger.warning("Token Vercel non configuré. Le déploiement Vercel peut échouer.")
+
+    @Utility.measure_execution_time
+    @Utility.retry_on_exception(retries=3, delay=5, exceptions=(NetworkError, requests.exceptions.ConnectionError))
+    def run(self, action: str, platform: str, project_path: str, project_name: str = None, **kwargs):
+        self.logger.info(f"Exécution de CloudDeploymentModule pour le projet '{project_path}' sur la plateforme '{platform}' avec l'action: {action}")
+
+        if action == "deploy":
+            if platform.lower() == "vercel":
+                return self._deploy_to_vercel(project_path, project_name)
+            else:
+                raise ValidationError(f"Plateforme de déploiement '{platform}' non supportée.")
+        elif action == "connect_domain":
+            domain = kwargs.get("domain")
+            if not domain:
+                raise ValidationError("Le nom de domaine est requis pour l'action 'connect_domain'.")
+            self.logger.info(f"Connexion du domaine '{domain}' (fonctionnalité à implémenter).")
+            return {"status": "info", "message": f"Fonctionnalité de connexion de domaine pour '{platform}' n'est pas encore implémentée."}
+        else:
+            raise AppError(f"Action '{action}' non supportée par CloudDeploymentModule.")
+
+    # ... (_deploy_to_vercel reste identique, sauf pour l'usage de self.vercel_token)
+    def _deploy_to_vercel(self, project_path: str, project_name: str = None):
+        if not os.path.isdir(project_path):
+            raise FileSystemError(f"Le chemin du projet '{project_path}' n'est pas un répertoire valide.")
+
+        self.logger.info(f"Déploiement du projet '{project_path}' sur Vercel...")
+        try:
+            Utility.execute_command(["vercel", "--version"], capture_output=False)
+        except ExternalCommandError:
+            raise AppError("Vercel CLI n'est pas installé ou n'est pas dans le PATH. Installez-le avec 'npm i -g vercel'.")
+
+        try:
+            env = os.environ.copy()
+            env["VERCEL_TOKEN"] = self.vercel_token
+
+            command = ["vercel", "--prod"]
+            if project_name:
+                command.extend(["--name", project_name])
+
+            self.logger.debug(f"Exécution de Vercel CLI dans '{project_path}' avec la commande: {command}")
+            output = Utility.execute_command(command, cwd=project_path, env=env)
+
+            deploy_url_match = re.search(r'https?://[\w.-]+\.vercel\.app', output)
+            deploy_url = deploy_url_match.group(0) if deploy_url_match else "URL non trouvée"
+
+            self.logger.info(f"Projet déployé sur Vercel. URL : {deploy_url}")
+            return {"status": "success", "message": f"Projet déployé sur Vercel. URL: {deploy_url}", "url": deploy_url}
+        except ExternalCommandError as e:
+            if "not linked" in e.stderr:
+                self.logger.warning(f"Le projet '{project_path}' n'est pas lié à Vercel. Tentative de liaison...")
+                try:
+                    link_output = Utility.execute_command(["vercel", "link"], cwd=project_path, env=env, capture_output=False)
+                    self.logger.info("Projet lié à Vercel. Réessayez le déploiement.")
+                    raise AppError(f"Le projet '{project_path}' a été lié à Vercel. Veuillez réessayer l'opération de déploiement.")
+                except ExternalCommandError as link_e:
+                     raise ExternalCommandError(f"Erreur lors de la liaison du projet Vercel: {link_e.stderr}", command=link_e.command, return_code=link_e.return_code, stdout=link_e.stdout, stderr=link_e.stderr)
+            raise
+        except Exception as e:
+            raise AppError(f"Erreur inattendue lors du déploiement Vercel: {e}")
+
+
+class AWSModule(BaseModule):
+    """Module pour les opérations AWS (S3, EC2, etc.)."""
+    def __init__(self, config_manager: ConfigManager, db_manager: DatabaseManager, secret_manager: SecretManager):
+        super().__init__(config_manager, db_manager, secret_manager)
+        if not boto3:
+            raise AppError("Le module 'boto3' est requis pour AWSModule.")
+        self.boto3 = boto3
+        self.ClientError = BotoClientError # Utilise le mock ou la vraie exception
+        # NOUVEAU: Récupération des clés AWS via SecretManager
+        self.aws_access_key_id = self.secrets.get_secret("AWS_ACCESS_KEY_ID")
+        self.aws_secret_access_key = self.secrets.get_secret("AWS_SECRET_ACCESS_KEY")
+        self.aws_region = self.config.get("aws.region", "eu-west-3")
+        if not self.aws_access_key_id or not self.aws_secret_access_key:
+            self.logger.warning("Clés d'accès AWS non configurées. Les opérations AWS peuvent échouer.")
+
+    @Utility.measure_execution_time
+    @Utility.retry_on_exception(retries=5, delay=3, exceptions=(NetworkError, BotoClientError))
+    def run(self, action: str, service: str, **kwargs):
+        self.logger.info(f"Exécution de AWSModule pour le service '{service}' avec l'action: {action}")
+
+        if service.lower() == "s3":
+            return self._handle_s3_operation(action, **kwargs)
+        else:
+            raise ValidationError(f"Service AWS '{service}' non supporté.")
+
+    # ... (_handle_s3_operation et ses sous-méthodes restent identiques, sauf pour l'initialisation du client S3)
+    def _handle_s3_operation(self, action: str, bucket_name: str, file_path: str = None, s3_key: str = None, local_dir: str = None, **kwargs):
+        s3 = self.boto3.client('s3',
+                               aws_access_key_id=self.aws_access_key_id,
+                               aws_secret_access_key=self.aws_secret_access_key,
+                               region_name=self.aws_region)
+
+        if action == "create_bucket":
+            return self._s3_create_bucket(s3, bucket_name)
+        elif action == "upload_file":
+            if not file_path or not s3_key:
+                raise ValidationError("Chemin du fichier local et clé S3 sont requis pour l'upload.")
+            return self._s3_upload_file(s3, bucket_name, file_path, s3_key)
+        elif action == "download_file":
+            if not s3_key or not local_dir:
+                raise ValidationError("Clé S3 et répertoire local sont requis pour le téléchargement.")
+            return self._s3_download_file(s3, bucket_name, s3_key, local_dir)
+        elif action == "list_objects":
+            return self._s3_list_objects(s3, bucket_name)
+        elif action == "delete_object":
+            if not s3_key:
+                raise ValidationError("Clé S3 est requise pour la suppression d'objet.")
+            return self._s3_delete_object(s3, bucket_name, s3_key)
+        elif action == "delete_bucket":
+            return self._s3_delete_bucket(s3, bucket_name)
+        else:
+            raise AppError(f"Action S3 '{action}' non supportée.")
+
+    def _s3_create_bucket(self, s3_client, bucket_name):
+        self.logger.info(f"Création du bucket S3: {bucket_name}")
+        try:
+            s3_client.create_bucket(Bucket=bucket_name, CreateBucketConfiguration={'LocationConstraint': self.aws_region})
+            self.logger.info(f"Bucket '{bucket_name}' créé avec succès.")
+            return {"status": "success", "message": f"Bucket '{bucket_name}' créé."}
+        except self.ClientError as e:
+            if e.response['Error']['Code'] == 'BucketAlreadyOwnedByYou':
+                self.logger.warning(f"Bucket '{bucket_name}' existe déjà et vous en êtes le propriétaire. Skipping creation.")
+                return {"status": "skipped", "message": f"Bucket '{bucket_name}' existe déjà."}
+            raise NetworkError(f"Erreur AWS S3 lors de la création du bucket: {e}", status_code=e.response['ResponseMetadata']['HTTPStatusCode'])
+        except Exception as e:
+            raise AppError(f"Erreur inattendue lors de la création du bucket S3: {e}")
+
+    def _s3_upload_file(self, s3_client, bucket_name, file_path, s3_key):
+        if not os.path.exists(file_path) or not os.path.isfile(file_path):
+            raise FileSystemError(f"Le fichier local '{file_path}' n'existe pas ou n'est pas un fichier.")
+        self.logger.info(f"Upload du fichier '{file_path}' vers s3://{bucket_name}/{s3_key}")
+        try:
+            s3_client.upload_file(file_path, bucket_name, s3_key)
+            self.logger.info(f"Fichier '{file_path}' uploadé avec succès vers S3.")
+            return {"status": "success", "message": f"Fichier uploadé vers s3://{bucket_name}/{s3_key}"}
+        except self.ClientError as e:
+            raise NetworkError(f"Erreur AWS S3 lors de l'upload: {e}", status_code=e.response['ResponseMetadata']['HTTPStatusCode'])
+        except Exception as e:
+            raise AppError(f"Erreur inattendue lors de l'upload S3: {e}")
+
+    def _s3_download_file(self, s3_client, bucket_name, s3_key, local_dir):
+        os.makedirs(local_dir, exist_ok=True)
+        local_path = os.path.join(local_dir, os.path.basename(s3_key))
+        self.logger.info(f"Téléchargement de s3://{bucket_name}/{s3_key} vers '{local_path}'")
+        try:
+            s3_client.download_file(bucket_name, s3_key, local_path)
+            self.logger.info(f"Fichier '{s3_key}' téléchargé avec succès vers '{local_path}'.")
+            return {"status": "success", "message": f"Fichier téléchargé vers {local_path}"}
+        except self.ClientError as e:
+            if e.response['Error']['Code'] == 'NoSuchKey':
+                raise FileSystemError(f"La clé S3 '{s3_key}' n'existe pas dans le bucket '{bucket_name}'.")
+            raise NetworkError(f"Erreur AWS S3 lors du téléchargement: {e}", status_code=e.response['ResponseMetadata']['HTTPStatusCode'])
+        except Exception as e:
+            raise AppError(f"Erreur inattendue lors du téléchargement S3: {e}")
+
+    def _s3_list_objects(self, s3_client, bucket_name):
+        self.logger.info(f"Liste des objets dans le bucket S3: {bucket_name}")
+        try:
+            response = s3_client.list_objects_v2(Bucket=bucket_name)
+            contents = response.get('Contents', [])
+            object_keys = [obj['Key'] for obj in contents]
+            self.logger.info(f"Objets dans '{bucket_name}': {object_keys}")
+            return {"status": "success", "objects": object_keys}
+        except self.ClientError as e:
+            if e.response['Error']['Code'] == 'NoSuchBucket':
+                raise FileSystemError(f"Le bucket '{bucket_name}' n'existe pas.")
+            raise NetworkError(f"Erreur AWS S3 lors de la liste des objets: {e}", status_code=e.response['ResponseMetadata']['HTTPStatusCode'])
+        except Exception as e:
+            raise AppError(f"Erreur inattendue lors de la liste des objets S3: {e}")
+
+    def _s3_delete_object(self, s3_client, bucket_name, s3_key):
+        self.logger.info(f"Suppression de l'objet s3://{bucket_name}/{s3_key}")
+        try:
+            s3_client.delete_object(Bucket=bucket_name, Key=s3_key)
+            self.logger.info(f"Objet '{s3_key}' supprimé avec succès du bucket '{bucket_name}'.")
+            return {"status": "success", "message": f"Objet s3://{bucket_name}/{s3_key} supprimé."}
+        except self.ClientError as e:
+            raise NetworkError(f"Erreur AWS S3 lors de la suppression d'objet: {e}", status_code=e.response['ResponseMetadata']['HTTPStatusCode'])
+        except Exception as e:
+            raise AppError(f"Erreur inattendue lors de la suppression d'objet S3: {e}")
+
+    def _s3_delete_bucket(self, s3_client, bucket_name):
+        self.logger.info(f"Suppression du bucket S3: {bucket_name}")
+        try:
+            objects = self._s3_list_objects(s3_client, bucket_name)["objects"]
+            if objects:
+                raise ValidationError(f"Le bucket '{bucket_name}' n'est pas vide. Veuillez supprimer tous les objets avant de supprimer le bucket.")
+
+            s3_client.delete_bucket(Bucket=bucket_name)
+            self.logger.info(f"Bucket '{bucket_name}' supprimé avec succès.")
+            return {"status": "success", "message": f"Bucket '{bucket_name}' supprimé."}
+        except self.ClientError as e:
+            if e.response['Error']['Code'] == 'NoSuchBucket':
+                self.logger.warning(f"Bucket '{bucket_name}' n'existe pas. Skipping deletion.")
+                return {"status": "skipped", "message": f"Bucket '{bucket_name}' n'existe pas."}
+            raise NetworkError(f"Erreur AWS S3 lors de la suppression du bucket: {e}", status_code=e.response['ResponseMetadata']['HTTPStatusCode'])
+        except ValidationError:
+            raise
+        except Exception as e:
+            raise AppError(f"Erreur inattendue lors de la suppression du bucket S3: {e}")
+
+
+class SystemUtilityModule(BaseModule):
+    """Module pour les opérations système générales (nettoyage, info)."""
+    def __init__(self, config_manager: ConfigManager, db_manager: DatabaseManager, secret_manager: SecretManager):
+        super().__init__(config_manager, db_manager, secret_manager)
+
+    @Utility.measure_execution_time
+    def run(self, action: str, path: str = None, **kwargs):
+        self.logger.info(f"Exécution de SystemUtilityModule avec l'action: {action}")
+
+        if action == "clean_logs":
+            return self._clean_logs()
+        elif action == "get_disk_space":
+            if not path:
+                raise ValidationError("Un chemin est requis pour obtenir l'espace disque.")
+            return self._get_disk_space(path)
+        elif action == "create_dir":
+            if not path:
+                raise ValidationError("Un chemin est requis pour créer un répertoire.")
+            return self._create_directory(path)
+        elif action == "delete_dir":
+            if not path:
+                raise ValidationError("Un chemin est requis pour supprimer un répertoire.")
+            return self._delete_directory(path)
+        else:
+            raise AppError(f"Action '{action}' non supportée par SystemUtilityModule.")
+
+    # ... (_clean_logs, _get_disk_space, _create_directory, _delete_directory restent identiques)
+    def _clean_logs(self):
+        retained_days = self.config.get("logging.retained_days", 7)
+        cleaned_files_count = 0
+        cleaned_size_bytes = 0
+        current_date = datetime.date.today()
+
+        self.logger.info(f"Nettoyage des logs plus anciens que {retained_days} jours dans '{LOG_DIR}'...")
+        for filename in os.listdir(LOG_DIR):
+            file_path = os.path.join(LOG_DIR, filename)
+            if os.path.isfile(file_path) and filename.startswith("app_") and filename.endswith(".log"):
+                try:
+                    file_date_str = filename[len("app_"): -len(".log")]
+                    file_date = datetime.datetime.strptime(file_date_str, "%Y-%m-%d").date()
+                    if (current_date - file_date).days > retained_days:
+                        file_size = os.path.getsize(file_path)
+                        os.remove(file_path)
+                        cleaned_files_count += 1
+                        cleaned_size_bytes += file_size
+                        self.logger.info(f"Supprimé le fichier de log ancien: {filename}")
+                except ValueError:
+                    self.logger.warning(f"Format de date invalide dans le nom de fichier de log: {filename}. Skipping.")
+                except Exception as e:
+                    self.logger.error(f"Erreur lors de la suppression du fichier de log '{filename}': {e}")
+        self.logger.info(f"Nettoyage des logs terminé. Supprimé {cleaned_files_count} fichiers, libéré {cleaned_size_bytes / (1024*1024):.2f} Mo.")
+        return {"status": "success", "message": f"Nettoyage des logs terminé. {cleaned_files_count} fichiers supprimés."}
+
+    def _get_disk_space(self, path):
+        try:
+            total, used, free = shutil.disk_usage(path)
+            self.logger.info(f"Espace disque pour '{path}': Total={total/(1024**3):.2f}GB, Utilisé={used/(1024**3):.2f}GB, Libre={free/(1024**3):.2f}GB")
+            return {
+                "status": "success",
+                "path": path,
+                "total_bytes": total,
+                "used_bytes": used,
+                "free_bytes": free,
+                "total_gb": round(total / (1024**3), 2),
+                "used_gb": round(used / (1024**3), 2),
+                "free_gb": round(free / (1024**3), 2)
+            }
+        except Exception as e:
+            raise FileSystemError(f"Erreur lors de la récupération de l'espace disque pour '{path}': {e}", path=path)
+
+    def _create_directory(self, path):
+        try:
+            os.makedirs(path, exist_ok=True)
+            self.logger.info(f"Répertoire '{path}' créé ou existant.")
+            return {"status": "success", "message": f"Répertoire '{path}' créé."}
+        except Exception as e:
+            raise FileSystemError(f"Erreur lors de la création du répertoire '{path}': {e}", path=path)
+
+    def _delete_directory(self, path):
+        if not os.path.exists(path):
+            raise FileSystemError(f"Le répertoire '{path}' n'existe pas.", path=path)
+        try:
+            shutil.rmtree(path)
+            self.logger.info(f"Répertoire '{path}' supprimé avec succès.")
+            return {"status": "success", "message": f"Répertoire '{path}' supprimé."}
+        except Exception as e:
+            raise FileSystemError(f"Erreur lors de la suppression du répertoire '{path}': {e}", path=path)
+
+
+# --- Modules Génériques ---
+
+class FileProcessingModule(BaseModule):
+    """Module pour le traitement de fichiers."""
+    def __init__(self, config_manager: ConfigManager, db_manager: DatabaseManager, secret_manager: SecretManager):
+        super().__init__(config_manager, db_manager, secret_manager)
+        self.input_dir = self.config.get("file_processing.input_directory", os.path.join(os.getcwd(), "input_files"))
+        self.output_dir = self.config.get("file_processing.output_directory", os.path.join(os.getcwd(), "output_files"))
+        os.makedirs(self.input_dir, exist_ok=True)
+        os.makedirs(self.output_dir, exist_ok=True)
+
+    @Utility.measure_execution_time
+    def run(self, action: str, file_path: str = None, content: str = None, **kwargs):
+        self.logger.info(f"Exécution de FileProcessingModule avec l'action: {action}")
+        if action == "read":
+            if not file_path:
+                raise ValidationError("Chemin du fichier requis pour l'action 'read'.")
+            return self._read_file(os.path.join(self.input_dir, file_path))
+        elif action == "write":
+            if not file_path or content is None:
+                raise ValidationError("Chemin du fichier et contenu requis pour l'action 'write'.")
+            self._write_file(os.path.join(self.output_dir, file_path), content)
+            return {"status": "success", "message": f"Fichier '{file_path}' écrit avec succès."}
+        elif action == "list":
+            return self._list_files(self.input_dir)
+        else:
+            raise AppError(f"Action '{action}' non supportée par FileProcessingModule.")
+
+    def _read_file(self, path):
+        with Utility.safe_file_operation(path, 'r') as f:
+            data = f.read()
+            self.logger.info(f"Fichier lu : {path}")
+            return data
+
+    def _write_file(self, path, content):
+        with Utility.safe_file_operation(path, 'w') as f:
+            f.write(content)
+            self.logger.info(f"Fichier écrit : {path}")
+
+    def _list_files(self, directory):
+        try:
+            files = [f for f in os.listdir(directory) if os.path.isfile(os.path.join(directory, f))]
+            self.logger.info(f"Fichiers listés dans {directory}: {files}")
+            return {"status": "success", "files": files}
+        except Exception as e:
+            raise FileSystemError(f"Impossible de lister les fichiers dans {directory}: {e}", path=directory)
+
+class NetworkModule(BaseModule):
+    """Module pour les opérations réseau (ex: requêtes HTTP)."""
+    def __init__(self, config_manager: ConfigManager, db_manager: DatabaseManager, secret_manager: SecretManager):
+        super().__init__(config_manager, db_manager, secret_manager)
+        if not requests:
+            raise AppError("Le module 'requests' est requis pour NetworkModule.")
+        self.requests = requests
+        self.api_key = self.secrets.get_secret("API_KEY", self.config.get("api.key")) # Priorise secret, sinon config
+        self.api_endpoint = self.config.get("api.endpoint", "https://api.example.com")
+
+    @Utility.measure_execution_time
+    @Utility.retry_on_exception(retries=5, delay=2, exceptions=(requests.exceptions.ConnectionError, requests.exceptions.Timeout))
+    def run(self, method: str, path: str, params: dict = None, data: dict = None, headers: dict = None):
+        self.logger.info(f"Exécution de NetworkModule: {method.upper()} {self.api_endpoint}{path}")
+        url = f"{self.api_endpoint}{path}"
+        default_headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+        if headers:
+            default_headers.update(headers)
+
+        try:
+            timeout = self.config.get("performance.timeout_seconds", 30)
+            if method.lower() == 'get':
+                response = self.requests.get(url, params=params, headers=default_headers, timeout=timeout)
+            elif method.lower() == 'post':
+                response = self.requests.post(url, json=data, params=params, headers=default_headers, timeout=timeout)
+            elif method.lower() == 'put':
+                response = self.requests.put(url, json=data, params=params, headers=default_headers, timeout=timeout)
+            elif method.lower() == 'delete':
+                response = self.requests.delete(url, params=params, headers=default_headers, timeout=timeout)
+            else:
+                raise ValidationError(f"Méthode HTTP '{method}' non supportée.")
+
+            response.raise_for_status()
+            self.logger.info(f"Requête réussie vers {url} avec statut {response.status_code}")
+            return {"status": "success", "data": response.json(), "status_code": response.status_code}
+        except self.requests.exceptions.HTTPError as e:
+            raise NetworkError(f"Erreur HTTP pour {url}: {e.response.status_code} - {e.response.text}", url=url, status_code=e.response.status_code)
+        except self.requests.exceptions.ConnectionError as e:
+            raise NetworkError(f"Erreur de connexion pour {url}: {e}", url=url)
+        except self.requests.exceptions.Timeout as e:
+            raise NetworkError(f"Délai d'attente dépassé pour {url}: {e}", url=url)
+        except self.requests.exceptions.RequestException as e:
+            raise NetworkError(f"Erreur générale lors de la requête vers {url}: {e}", url=url)
+
+class DataProcessingModule(BaseModule):
+    """Module pour le traitement et l'analyse de données."""
+    def __init__(self, config_manager: ConfigManager, db_manager: DatabaseManager, secret_manager: SecretManager):
+        super().__init__(config_manager, db_manager, secret_manager)
+        if not pd:
+            raise AppError("Le module 'pandas' est requis pour DataProcessingModule.")
+        self.pd = pd
+
+    @Utility.measure_execution_time
+    def run(self, action: str, data, params: dict = None, **kwargs):
+        self.logger.info(f"Exécution de DataProcessingModule avec l'action: {action}")
+        params = params or {}
+
+        if action == "analyze_csv":
+            if not isinstance(data, str):
+                raise ValidationError("Les données doivent être un chemin de fichier CSV ou une chaîne de caractères CSV pour l'analyse.")
+            try:
+                if os.path.exists(data):
+                    df = self.pd.read_csv(data)
+                else:
+                    from io import StringIO
+                    df = self.pd.read_csv(StringIO(data))
+
+                summary = {
+                    "shape": df.shape,
+                    "columns": df.columns.tolist(),
+                    "describe": df.describe().to_dict(),
+                    "null_counts": df.isnull().sum().to_dict()
+                }
+                self.logger.info(f"Analyse CSV terminée. Forme: {df.shape}")
+                return {"status": "success", "summary": summary}
+            except Exception as e:
+                raise AppError(f"Erreur lors de l'analyse du CSV: {e}")
+
+        elif action == "transform_dataframe":
+            if isinstance(data, str) and os.path.exists(data) and data.lower().endswith('.csv'):
+                try:
+                    df = self.pd.read_csv(data)
+                    self.logger.info(f"Chargé DataFrame depuis CSV: {data}")
+                except Exception as e:
+                    raise AppError(f"Erreur lors du chargement du CSV '{data}' pour transformation: {e}")
+            elif isinstance(data, list):
+                try:
+                    df = self.pd.DataFrame(data)
+                    self.logger.info("Créé DataFrame à partir de données JSON/listes.")
+                except Exception as e:
+                    raise ValidationError(f"Impossible de créer un DataFrame à partir des données fournies (liste de dicts attendue): {e}")
+            elif not isinstance(data, self.pd.DataFrame):
+                raise ValidationError("Les données doivent être un chemin de fichier CSV, une liste de dictionnaires, ou un DataFrame Pandas pour la transformation.")
+            else:
+                df = data
+
+            transformed_df = df.copy()
+            if params.get("clean_columns", False):
+                transformed_df.columns = [Utility.sanitize_filename(col, replacement='_').lower() for col in transformed_df.columns]
+                self.logger.info("Colonnes nettoyées.")
+
+            if "filter_column" in params and "filter_value" in params:
+                col = params["filter_column"]
+                val = params["filter_value"]
+                if col in transformed_df.columns:
+                    transformed_df = transformed_df[transformed_df[col] == val]
+                    self.logger.info(f"Filtrage appliqué sur la colonne '{col}' avec la valeur '{val}'.")
+                else:
+                    self.logger.warning(f"Colonne de filtrage '{col}' non trouvée.")
+
+            return {"status": "success", "data": transformed_df.to_dict(orient='records')}
+        else:
+            raise AppError(f"Action '{action}' non supportée par DataProcessingModule.")
+
+
+# --- NOUVEAU : Module de Planification (APScheduler) ---
+class SchedulerModule(BaseModule):
+    """Module pour planifier et gérer les tâches."""
+    def __init__(self, config_manager: ConfigManager, db_manager: DatabaseManager, secret_manager: SecretManager, module_manager: ModuleManager):
+        super().__init__(config_manager, db_manager, secret_manager)
+        if not BackgroundScheduler:
+            raise AppError("APScheduler n'est pas installé. Le module de planification est désactivé.")
+        self.scheduler = BackgroundScheduler()
+        self.module_manager = module_manager # Référence au ModuleManager pour exécuter les tâches
+        self._load_jobs_from_db() # Charge les tâches persistées au démarrage
+
+    def _load_jobs_from_db(self):
+        """Charge les tâches planifiées depuis la base de données et les ajoute au scheduler."""
+        if not self.db_manager:
+            self.logger.warning("Base de données non disponible, impossible de charger les tâches planifiées.")
+            return
+
+        with self.db_manager.get_session() as session:
+            tasks = session.query(TaskSchedule).filter_by(enabled=True).all()
+            for task in tasks:
+                try:
+                    params = json.loads(task.params_json) if task.params_json else {}
+                    trigger_config = json.loads(task.trigger_config_json)
+                    trigger = None
+
+                    if task.trigger_type == "interval":
+                        trigger = IntervalTrigger(**trigger_config)
+                    elif task.trigger_type == "cron":
+                        trigger = CronTrigger(**trigger_config)
+                    else:
+                        self.logger.warning(f"Type de déclencheur inconnu pour la tâche '{task.task_name}': {task.trigger_type}. Skipping.")
+                        continue
+
+                    self.scheduler.add_job(
+                        self._scheduled_task_wrapper,
+                        trigger=trigger,
+                        id=task.task_name,
+                        name=task.task_name,
+                        replace_existing=True,
+                        args=[task.module_name, task.action_name, params]
+                    )
+                    self.logger.info(f"Tâche planifiée '{task.task_name}' chargée et ajoutée au scheduler.")
+                except Exception as e:
+                    self.logger.error(f"Erreur lors du chargement de la tâche planifiée '{task.task_name}' depuis la DB: {e}")
+
+    def _scheduled_task_wrapper(self, module_name, action_name, params):
+        """Wrapper pour exécuter les tâches planifiées."""
+        self.logger.info(f"Début de l'exécution de la tâche planifiée : {module_name}.{action_name} avec params {params}")
+        try:
+            result = self.module_manager.execute_module_action(module_name, action_name, params=params)
+            self.logger.info(f"Tâche planifiée {module_name}.{action_name} terminée avec succès. Résultat : {result}")
+            # Mettre à jour last_run_time et next_run_time dans la DB
+            if self.db_manager:
+                with self.db_manager.get_session() as session:
+                    task_record = session.query(TaskSchedule).filter_by(task_name=self.scheduler.get_job(module_name).name).first()
+                    if task_record:
+                        task_record.last_run_time = datetime.datetime.now()
+                        # next_run_time est géré par APScheduler, mais on peut le récupérer si nécessaire
+                        # job_next_run_time = self.scheduler.get_job(task_name).next_run_time
+                        # task_record.next_run_time = job_next_run_time
+                        session.add(task_record)
+                        session.commit()
+        except Exception as e:
+            self.logger.error(f"Erreur lors de l'exécution de la tâche planifiée {module_name}.{action_name}: {e}")
+
+    def run(self, action: str, **kwargs):
+        self.logger.info(f"Exécution de SchedulerModule avec l'action: {action}")
+
+        if action == "start":
+            self.scheduler.start()
+            self.logger.info("Scheduler démarré.")
+            return {"status": "success", "message": "Scheduler démarré."}
+        elif action == "shutdown":
+            self.scheduler.shutdown()
+            self.logger.info("Scheduler arrêté.")
+            return {"status": "success", "message": "Scheduler arrêté."}
+        elif action == "add_job":
+            task_name = kwargs.get("task_name")
+            module_name = kwargs.get("module_name")
+            action_name = kwargs.get("action_name")
+            params = kwargs.get("params", {})
+            trigger_type = kwargs.get("trigger_type")
+            trigger_config = kwargs.get("trigger_config")
+
+            if not all([task_name, module_name, action_name, trigger_type, trigger_config]):
+                raise ValidationError("task_name, module_name, action_name, trigger_type, trigger_config sont requis.")
+
+            job = None
+            if trigger_type == "interval":
+                job = self.scheduler.add_job(self._scheduled_task_wrapper, IntervalTrigger(**trigger_config), id=task_name, name=task_name, args=[module_name, action_name, params])
+            elif trigger_type == "cron":
+                job = self.scheduler.add_job(self._scheduled_task_wrapper, CronTrigger(**trigger_config), id=task_name, name=task_name, args=[module_name, action_name, params])
+            else:
+                raise ValidationError(f"Type de déclencheur '{trigger_type}' non supporté. Utilisez 'interval' ou 'cron'.")
+
+            # Persister la tâche en DB
+            if self.db_manager:
+                with self.db_manager.get_session() as session:
+                    task_record = TaskSchedule(
+                        task_name=task_name,
+                        module_name=module_name,
+                        action_name=action_name,
+                        params_json=json.dumps(params),
+                        trigger_type=trigger_type,
+                        trigger_config_json=json.dumps(trigger_config),
+                        enabled=True,
+                        next_run_time=job.next_run_time if job else None # APScheduler met à jour next_run_time
+                    )
+                    session.add(task_record)
+                    session.commit()
+
+            self.logger.info(f"Tâche planifiée '{task_name}' ajoutée.")
+            return {"status": "success", "message": f"Tâche planifiée '{task_name}' ajoutée.", "next_run": str(job.next_run_time) if job else "N/A"}
+        elif action == "remove_job":
+            task_name = kwargs.get("task_name")
+            if not task_name:
+                raise ValidationError("task_name est requis pour supprimer une tâche.")
+            self.scheduler.remove_job(task_name)
+            # Supprimer de la DB
+            if self.db_manager:
+                with self.db_manager.get_session() as session:
+                    task_record = session.query(TaskSchedule).filter_by(task_name=task_name).first()
+                    if task_record:
+                        session.delete(task_record)
+                        session.commit()
+            self.logger.info(f"Tâche planifiée '{task_name}' supprimée.")
+            return {"status": "success", "message": f"Tâche planifiée '{task_name}' supprimée."}
+        elif action == "list_jobs":
+            jobs = []
+            for job in self.scheduler.get_jobs():
+                jobs.append({
+                    "id": job.id,
+                    "name": job.name,
+                    "trigger": str(job.trigger),
+                    "next_run_time": str(job.next_run_time),
+                    "pending": job.pending
+                })
+            return {"status": "success", "jobs": jobs}
+        else:
+            raise AppError(f"Action '{action}' non supportée par SchedulerModule.")
+
+
+# --- NOUVEAU : API Web (FastAPI) ---
+class WebAPI:
+    """Expose les fonctionnalités de l'application via une API Web FastAPI."""
+    def __init__(self, module_manager: ModuleManager, config_manager: ConfigManager):
+        if not FastAPI or not uvicorn:
+            logger.error("FastAPI ou Uvicorn ne sont pas installés. Impossible de démarrer l'API Web.")
+            self.app = None
+            return
+
+        self.app = FastAPI(
+            title=config_manager.get("app.name"),
+            version=config_manager.get("app.version"),
+            description="API pour interagir avec le Script Omniscient."
+        )
+        self.module_manager = module_manager
+        self.config = config_manager
+        self._setup_routes()
+
+    def _setup_routes(self):
+        @self.app.get("/")
+        async def read_root():
+            return {"message": "Bienvenue sur l'API du Script Omniscient !"}
+
+        @self.app.get("/modules")
+        async def get_modules():
+            return {"modules": self.module_manager.list_modules()}
+
+        @self.app.post("/execute/{module_name}/{action_name}")
+        async def execute_module(
+            module_name: str,
+            action_name: str,
+            params: dict = {},
+            data: dict = {}
+        ):
+            try:
+                # La logique d'exécution est centralisée dans ModuleManager.execute_module_action
+                result = self.module_manager.execute_module_action(module_name, action_name, data=data, params=params)
+                return JSONResponse(status_code=status.HTTP_200_OK, content={"status": "success", "result": result})
+            except AppError as e:
+                raise HTTPException(status_code=e.code, detail=e.message)
+            except Exception as e:
+                logger.exception(f"Erreur inattendue via API pour {module_name}.{action_name}")
+                raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Erreur interne du serveur: {e}")
+
+        @self.app.get("/config/{key_path:path}")
+        async def get_config_value(key_path: str):
+            value = self.config.get(key_path.replace('/', '.'))
+            if value is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Clé de configuration '{key_path}' non trouvée.")
+            return {"key": key_path, "value": value}
+
+        @self.app.post("/config/{key_path:path}")
+        async def set_config_value(key_path: str, value: dict): # Prend un dict pour la valeur pour plus de flexibilité
+            if "value" not in value:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Le corps de la requête doit contenir une clé 'value'.")
+            self.config.set(key_path.replace('/', '.'), value["value"])
+            self.config.save_config()
+            return {"status": "success", "message": f"Clé '{key_path}' mise à jour."}
+
+        @self.app.get("/logs")
+        async def get_logs(limit: int = 100):
+            if not self.module_manager.db_manager:
+                raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Base de données non disponible pour les logs.")
+            try:
+                with self.module_manager.db_manager.get_session() as session:
+                    logs = session.query(AppLogEntry).order_by(AppLogEntry.timestamp.desc()).limit(limit).all()
+                    return [{"timestamp": l.timestamp.isoformat(), "level": l.level, "message": l.message,
+                             "module": l.module_name, "action": l.action_name, "status": l.status} for l in logs]
+            except Exception as e:
+                raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Erreur lors de la récupération des logs: {e}")
+
+
+    def start(self):
+        if not self.app:
+            logger.error("API Web non initialisée.")
+            return
+        host = self.config.get("web_api.host", "127.0.0.1")
+        port = self.config.get("web_api.port", 8000)
+        logger.info(f"Démarrage de l'API Web sur http://{host}:{port}")
+        uvicorn.run(self.app, host=host, port=port)
+
+
+# --- Gestion de l'Interface Utilisateur (CLI) ---
+
+class CliApp:
+    """Gère l'interface en ligne de commande de l'application."""
+    def __init__(self, config_manager: ConfigManager, module_manager: ModuleManager, web_api_instance: WebAPI):
+        self.config = config_manager
+        self.module_manager = module_manager
+        self.web_api = web_api_instance
+        self.parser = argparse.ArgumentParser(
+            description="Un script Python ultra-complet et modulaire pour diverses tâches.",
+            formatter_class=argparse.RawTextHelpFormatter
+        )
+        self._setup_arguments()
+
+    def _setup_arguments(self):
+        """Définit les arguments de ligne de commande."""
+        self.parser.add_argument('--config', '-c', type=str, default=DEFAULT_CONFIG_PATH,
+                                 help=f'Chemin vers le fichier de configuration (par défaut: {DEFAULT_CONFIG_PATH})')
+        self.parser.add_argument('--log-level', '-l', type=str, default=self.config.get("logging.level", "INFO"),
+                                 choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
+                                 help='Niveau de journalisation (DEBUG, INFO, WARNING, ERROR, CRITICAL)')
+        self.parser.add_argument('--version', '-v', action='version',
+                                 version=f'%(prog)s {self.config.get("app.version", "1.0.0")}')
+
+        subparsers = self.parser.add_subparsers(dest='command', help='Commandes disponibles')
+
+        list_parser = subparsers.add_parser('list-modules', help='Liste tous les modules enregistrés.')
+
+        run_parser = subparsers.add_parser('run', help='Exécute un module spécifique.')
+        run_parser.add_argument('module_name', type=str, help='Le nom du module à exécuter.')
+        run_parser.add_argument('action', type=str, help='L\'action à effectuer au sein du module.')
+        run_parser.add_argument('--params', type=str,
+                                help='Paramètres JSON pour le module (ex: \'{"key": "value"}\')',
+                                default='{}')
+        run_parser.add_argument('--data', type=str,
+                                help='Données JSON ou chemin de fichier pour le module (ex: \'{"item": 1}\' ou "path/to/file").',
+                                default='{}')
+
+        config_parser = subparsers.add_parser('config', help='Gère la configuration de l\'application.')
+        config_subparsers = config_parser.add_subparsers(dest='config_command', help='Sous-commandes de configuration')
+
+        get_config_parser = config_subparsers.add_parser('get', help='Récupère une valeur de configuration.')
+        get_config_parser.add_argument('key_path', type=str, help='Le chemin de la clé de configuration (ex: app.name).')
+
+        set_config_parser = config_subparsers.add_parser('set', help='Définit une valeur de configuration.')
+        set_config_parser.add_argument('key_path', type=str, help='Le chemin de la clé de configuration.')
+        set_config_parser.add_argument('value', type=str, help='La nouvelle valeur pour la clé. Convertie automatiquement.')
+
+        save_config_parser = config_subparsers.add_parser('save', help='Sauvegarde la configuration actuelle.')
+        save_config_parser.add_argument('--path', type=str, default=DEFAULT_CONFIG_PATH,
+                                        help='Chemin où sauvegarder le fichier de configuration.')
+
+        # NOUVEAU: Commande pour démarrer l'API Web
+        api_parser = subparsers.add_parser('start-api', help='Démarre le serveur API Web.')
+        api_parser.add_argument('--host', type=str, default=self.config.get("web_api.host"), help='Hôte pour l\'API Web.')
+        api_parser.add_argument('--port', type=int, default=self.config.get("web_api.port"), help='Port pour l\'API Web.')
+
+        # NOUVEAU: Commande pour démarrer le serveur Prometheus
+        metrics_parser = subparsers.add_parser('start-metrics', help='Démarre le serveur Prometheus (pour le scrap des métriques).')
+        metrics_parser.add_argument('--port', type=int, default=self.config.get("prometheus.port"), help='Port pour le serveur Prometheus.')
+
+
+    def run(self):
+        args = self.parser.parse_args()
+
+        numeric_level = getattr(logging, args.log_level.upper(), None)
+        if not isinstance(numeric_level, int):
+            raise ValueError(f'Niveau de journalisation invalide: {args.log_level}')
+        logging.getLogger().setLevel(numeric_level)
+        self.config.set("logging.level", args.log_level.upper())
+        logger.info(f"Niveau de journalisation défini sur {args.log_level.upper()}")
+
+        if args.command == 'list-modules':
+            self._handle_list_modules()
+        elif args.command == 'run':
+            self._handle_run_module(args)
+        elif args.command == 'config':
+            self._handle_config_command(args)
+        elif args.command == 'start-api':
+            if self.web_api:
+                self.config.set("web_api.host", args.host)
+                self.config.set("web_api.port", args.port)
+                self.web_api.start()
+            else:
+                logger.error("L'API Web n'est pas disponible (FastAPI/Uvicorn non installés ou erreur d'initialisation).")
+        elif args.command == 'start-metrics':
+            if Utility.metrics:
+                # Le serveur est déjà démarré lors de l'initialisation de MetricsManager
+                # si 'prometheus_client' est disponible. On peut juste informer l'utilisateur.
+                print(f"Serveur Prometheus déjà démarré sur le port {self.config.get('prometheus.port')}. Laissez ce processus en arrière-plan.")
+                # Garder le processus en vie pour que le serveur Prometheus continue de tourner
+                try:
+                    while True:
+                        time.sleep(3600) # Dormir une heure, ou jusqu'à Ctrl+C
+                except KeyboardInterrupt:
+                    print("\nServeur Prometheus arrêté.")
+            else:
+                logger.error("Le serveur Prometheus n'est pas disponible (prometheus_client non installé ou erreur d'initialisation).")
+        elif args.command is None:
+            self.parser.print_help()
+        else:
+            logger.error(f"Commande inconnue: {args.command}")
+            self.parser.print_help()
+
+    def _handle_list_modules(self):
+        modules = self.module_manager.list_modules()
+        if modules:
+            print("\nModules enregistrés :")
+            for module in modules:
+                print(f"- {module}")
+        else:
+            print("Aucun module enregistré.")
+
+    def _handle_run_module(self, args):
+        try:
+            params = json.loads(args.params)
+        except json.JSONDecodeError:
+            logger.error(f"Paramètres JSON invalides : {args.params}")
+            return
+
+        data = args.data
+        if data.startswith('{') and data.endswith('}') or data.startswith('[') and data.endswith(']'):
+            try:
+                data = json.loads(data)
+            except json.JSONDecodeError:
+                logger.error(f"Données JSON invalides : {args.data}")
+                return
+
+        try:
+            result = self.module_manager.execute_module_action(args.module_name, args.action, data=data, params=params)
+            print("\n--- Résultat de l'opération ---")
+            if result is not None:
+                if isinstance(result, (dict, list)):
+                    print(json.dumps(result, indent=2, ensure_ascii=False))
+                else:
+                    print(result)
+            print("------------------------------")
+        except AppError as e:
+            logger.error(f"Erreur d'application lors de l'exécution du module '{args.module_name}': {e.message} (Code: {e.code})")
+        except Exception as e:
+            logger.exception(f"Une erreur inattendue est survenue lors de l'exécution du module '{args.module_name}'.")
+
+    def _handle_config_command(self, args):
+        if args.config_command == 'get':
+            value = self.config.get(args.key_path)
+            if value is not None:
+                print(f"La valeur de '{args.key_path}' est : {value}")
+            else:
+                print(f"La clé '{args.key_path}' n'a pas été trouvée ou est nulle.")
+        elif args.config_command == 'set':
+            value = args.value
+            if value.lower() == 'true': value = True
+            elif value.lower() == 'false': value = False
+            elif value.isdigit(): value = int(value)
+            elif value.replace('.', '', 1).isdigit(): value = float(value)
+            else:
+                try:
+                    parsed_value = json.loads(value)
+                    if isinstance(parsed_value, (dict, list)): value = parsed_value
+                except json.JSONDecodeError: pass
+
+            self.config.set(args.key_path, value)
+            self.config.save_config()
+            print(f"La clé '{args.key_path}' a été définie à '{value}'.")
+        elif args.config_command == 'save':
+            self.config.save_config(args.path)
+            print(f"Configuration sauvegardée dans '{args.path}'.")
+        else:
+            logger.error(f"Sous-commande de configuration inconnue: {args.config_command}")
+            self.parser.print_help()
+
+
+# --- Point d'entrée principal de l'application ---
+
+def main():
+    """Fonction principale pour initialiser et lancer l'application."""
+    config_manager = ConfigManager()
+    secret_manager = SecretManager()
+    db_manager = DatabaseManager(db_path=config_manager.get("database.path"))
+    metrics_manager = MetricsManager(port=config_manager.get("prometheus.port")) # Initialise les métriques
+
+    module_manager = ModuleManager(config_manager, db_manager, secret_manager)
+
+    # Enregistrer les modules disponibles
+    try:
+        module_manager.register_module("file_processing", FileProcessingModule)
+        module_manager.register_module("network", NetworkModule)
+        module_manager.register_module("data_processing", DataProcessingModule)
+        module_manager.register_module("project_management", ProjectManagementModule)
+        module_manager.register_module("github", GitHubModule)
+        module_manager.register_module("cloud_deployment", CloudDeploymentModule)
+        module_manager.register_module("aws", AWSModule)
+        module_manager.register_module("system_utility", SystemUtilityModule)
+        if BackgroundScheduler: # Enregistre le module scheduler si APScheduler est dispo
+            module_manager.register_module("scheduler", lambda *args: SchedulerModule(*args, module_manager=module_manager))
+    except AppError as e:
+        logger.error(f"Erreur lors de l'enregistrement des modules: {e.message}")
+        sys.exit(1)
+    except Exception as e:
+        logger.exception("Une erreur inattendue est survenue lors de l'enregistrement des modules.")
+        sys.exit(1)
+
+    # Initialisation de l'API Web si disponible
+    web_api_instance = None
+    if FastAPI and uvicorn:
+        web_api_instance = WebAPI(module_manager, config_manager)
+    else:
+        logger.warning("API Web non disponible. Installez FastAPI et Uvicorn pour l'activer.")
+
+    app = CliApp(config_manager, module_manager, web_api_instance)
+    try:
+        app.run()
+    except Exception as e:
+        logger.critical(f"Une erreur critique est survenue dans l'application principale: {e}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
